@@ -1,0 +1,31 @@
+[package]
+name = "traffic-light-display"
+version = "0.1.0"
+authors = ["Caleb L. Power <cpower@axonibyte.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+[[bin]]
+name = "traffic-light-display"
+harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+[profile.dev]
+debug = true    # Symbols are nice, and they don't increase the size on Flash
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+embedded-svc = "=0.28.1"
+esp-idf-hal = "0.45"
+esp-idf-svc = { version = "0.51.0", features = ["critical-section"] }
+smart-leds = "0.4.0"
+ws2812-esp32-rmt-driver = { version = "0.13.1", features = ["smart-leds-trait"] }
+
+[build-dependencies]
+embuild = "0.33"
