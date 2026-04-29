@@ -1,3 +1,6 @@
+mod display;
+
+use display::DisplayDriver;
 use embedded_svc::http::Headers;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{PinDriver, Pull};
@@ -10,7 +13,7 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::wifi::{
     AccessPointConfiguration, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
 };
-use smart_leds::{SmartLedsWrite, RGB8};
+use smart_leds::RGB8;
 use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
 fn main() {
@@ -22,7 +25,7 @@ fn main() {
     let peripherals = Peripherals::take().unwrap();
     let led_pin = peripherals.pins.gpio13;
     let channel = peripherals.rmt.channel0;
-    let mut ws2812 = Ws2812Esp32Rmt::new(channel, led_pin).unwrap();
+    let ws2812 = Ws2812Esp32Rmt::new(channel, led_pin).unwrap();
 
     // set up non-volatile storage on the ESP32
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
@@ -81,27 +84,20 @@ fn main() {
         .map(|s| s.to_string());
 
     let colors = [
-        RGB8::new(50, 0, 0),   // red
-        RGB8::new(0, 50, 0),   // green
-        RGB8::new(0, 0, 50),   // blue
-        RGB8::new(50, 50, 0),  // yellow
-        RGB8::new(50, 0, 50),  // magenta
-        RGB8::new(0, 50, 50),  // cyan
-        RGB8::new(50, 50, 50), // white
+        RGB8::new(195, 78, 75),  // red
+        RGB8::new(61, 132, 175), // blue
+        RGB8::new(216, 163, 0),  // yellow
+        RGB8::new(137, 177, 8),  // green
     ];
 
-    let mut pixels = [RGB8::default(); 199];
+    // display driver
+    let display = DisplayDriver::new(ws2812);
 
     // enter wireless setup if requested or if we're missing the wireless config
     if wap_mode == 1 || ssid.is_none() {
         println!("> activating access point");
-        for i in 0..8 {
-            pixels[i] = RGB8::new(0, 0, 50);
-        }
-        for i in 8..199 {
-            pixels[i] = RGB8::new(100, 100, 100);
-        }
-        ws2812.write(pixels.iter().cloned()).unwrap();
+        display.set_status_color(RGB8::new(0, 0, 50));
+        display.set_image(&[100; 192]);
         run_ap_mode(&mut wifi, nvs_partition.clone());
     } else {
         // connect to the wifi
@@ -132,50 +128,27 @@ fn main() {
 
         if !connected {
             println!("> failed to connect; re-entering ap mode");
-            for i in 0..8 {
-                pixels[i] = RGB8::new(50, 0, 0);
-            }
-            ws2812.write(pixels.iter().cloned()).unwrap();
+            display.set_status_color(RGB8::new(50, 0, 0));
+            display.set_image(&[100; 192]);
             run_ap_mode(&mut wifi, nvs_partition.clone());
         } else {
             println!("> connected successfully");
-            for i in 0..199 {
-                pixels[i] = RGB8::new(0, 50, 0);
-            }
-            ws2812.write(pixels.iter().cloned()).unwrap();
+            display.set_status_color(RGB8::new(0, 50, 0));
+            display.set_image(&[100; 192]);
             FreeRtos::delay_ms(2000);
         }
     }
 
     println!("> launching animation");
-
-    for i in 0..199 {
-        pixels[i] = RGB8::new(100, 100, 100); // bright white
-        ws2812.write(pixels.iter().cloned()).unwrap();
-    }
+    display.set_image(&[100; 192]);
 
     // main animation loop
+    let mut color_idx = 0;
     loop {
-        // for each of the first 8 LEDs
-        for i in 0..8 {
-            // for each color
-            for color in colors.iter() {
-                // shut off all LEDs
-                for j in 0..8 {
-                    pixels[j] = RGB8::default();
-                }
-                // activate ONLY the current LED
-                pixels[i] = *color;
-                // push the data array to the physical strip
-                ws2812.write(pixels.iter().cloned()).unwrap();
-                // wait 142 ms per color (about 1 second per LED)
-                FreeRtos::delay_ms(142);
-            }
-
-            // turn off current LED before outer loop moves to next one
-            pixels[i] = RGB8::default();
-            ws2812.write(pixels.iter().cloned()).unwrap();
-        }
+        // display driver implicit loop automatically animates status gradient
+        display.set_status_color(colors[color_idx]);
+        color_idx = (color_idx + 1) % colors.len();
+        FreeRtos::delay_ms(1000);
     }
 }
 
