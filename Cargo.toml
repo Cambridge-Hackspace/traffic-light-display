@@ -29,3 +29,6 @@ ws2812-esp32-rmt-driver = { version = "0.13.1", features = ["smart-leds-trait"] 
 
 [build-dependencies]
 embuild = "0.33"
+
+[features]
+console-sim = []

@@ -54,7 +54,9 @@ impl DisplayDriver {
                 }
 
                 // write mapped array to physical strip
-                let _ = ws2812.write(pixels.iter().cloned());
+                if let Err(e) = ws2812.write(pixels.iter().cloned()) {
+                    println!("> ws2812 write error: {:?}", e);
+                }
 
                 tick = tick.wrapping_add(1);
                 FreeRtos::delay_ms(125);
@@ -72,6 +74,10 @@ impl DisplayDriver {
 
     pub fn set_image(&self, image: &[u8; 192]) {
         if let Ok(mut lock) = self.state.lock() {
+            #[cfg(feature = "console-sim")]
+            if lock.image != *image {
+                Self::print_sim(image);
+            }
             lock.image.copy_from_slice(image);
         }
     }
@@ -101,5 +107,28 @@ impl DisplayDriver {
         let offset = if c % 2 == 0 { y } else { 7 - y }; // serpentine
 
         Some(base + offset)
+    }
+
+    #[cfg(feature = "console-sim")]
+    fn print_sim(image: &[u8; 192]) {
+        let mut out = String::with_capacity(24 * 8 * 3 + 100);
+        out.push_str("\n+------------------------------------------------+\n");
+        for y in 0..8 {
+            out.push('|');
+            for x in 0..24 {
+                let val = image[y * 24 + x];
+                let c = match val {
+                    0..=5 => "  ",
+                    6..=25 => "░░",
+                    26..=50 => "▒▒",
+                    51..=75 => "▓▓",
+                    _ => "██",
+                };
+                out.push_str(c);
+            }
+            out.push_str("|\n");
+        }
+        out.push_str("+------------------------------------------------+\n");
+        print!("{}", out);
     }
 }
