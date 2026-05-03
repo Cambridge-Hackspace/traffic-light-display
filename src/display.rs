@@ -19,12 +19,10 @@ impl DisplayDriver {
     // HARDWARE INITIALIZER (ESP32 ONLY)
     // --------------------------------------------------------
     #[cfg(target_os = "espidf")]
-    pub fn new<W1, W2>(mut status_leds: W1, mut screen_leds: W2) -> Self
+    pub fn new<W>(mut leds: W) -> Self
     where
-        W1: SmartLedsWrite<Color = RGB8> + Send + 'static,
-        W1::Error: std::fmt::Debug,
-        W2: SmartLedsWrite<Color = RGB8> + Send + 'static,
-        W2::Error: std::fmt::Debug,
+        W: SmartLedsWrite<Color = RGB8> + Send + 'static,
+        W::Error: std::fmt::Debug,
     {
         let state = Arc::new(Mutex::new(DisplayState {
             status_color: RGB8::default(),
@@ -37,8 +35,7 @@ impl DisplayDriver {
             let mut tick: usize = 0;
             let brightnesses: [u8; 8] = [12, 18, 24, 31, 42, 56, 75, 100];
 
-            let mut status_pixels = [RGB8::default(); 8];
-            let mut screen_pixels = [RGB8::default(); 300];
+            let mut pixels = [RGB8::default(); 308];
 
             loop {
                 let (status_color, image) = {
@@ -49,7 +46,7 @@ impl DisplayDriver {
                 // sliding gradient on status LEDs
                 for i in 0..8 {
                     let b = brightnesses[(8 + i - (tick % 8)) % 8];
-                    status_pixels[i] = Self::scale_color(status_color, b);
+                    pixels[i] = Self::scale_color(status_color, b);
                 }
 
                 // map 30x10 grayscale logical image to physical serpentine grid
@@ -57,17 +54,14 @@ impl DisplayDriver {
                     for x in 0..30 {
                         if let Some(idx) = Self::get_pixel_index(x, y) {
                             let val = image[y * 30 + x];
-                            screen_pixels[idx] = RGB8::new(val, val, val);
+                            pixels[8 + idx] = RGB8::new(val, val, val); // shift matrix to skip the status strip
                         }
                     }
                 }
 
                 // write mapped array to physical strip
-                if let Err(e) = status_leds.write(status_pixels.iter().cloned()) {
-                    println!("> status ws2812 write error: {:?}", e);
-                }
-                if let Err(e) = screen_leds.write(screen_pixels.iter().cloned()) {
-                    println!("> screen ws2811 write error: {:?}", e);
+                if let Err(e) = leds.write(pixels.iter().cloned()) {
+                    println!("> led strip write error: {:?}", e);
                 }
 
                 tick = tick.wrapping_add(1);

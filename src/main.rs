@@ -33,15 +33,10 @@ fn main() {
 
     let peripherals = Peripherals::take().unwrap();
 
-    // set up status LED strip -- pin D13 on the ESP32
-    let status_pin = peripherals.pins.gpio13;
-    let status_channel = peripherals.rmt.channel0;
-    let status_ws2812 = Ws2812Esp32Rmt::new(status_channel, status_pin).unwrap();
-
-    // set up main screen panels -- pin D15 on the ESP32
-    let screen_pin = peripherals.pins.gpio15;
-    let screen_channel = peripherals.rmt.channel1;
-    let screen_ws2811 = Ws2812Esp32Rmt::new(screen_channel, screen_pin).unwrap();
+    // set up combined LED strip (status + screen) - pin D13 on the ESP32
+    let led_pin = peripherals.pins.gpio13;
+    let led_channel = peripherals.rmt.channel0;
+    let led_strip = Ws2812Esp32Rmt::new(led_channel, led_pin).unwrap();
 
     // set up non-volatile storage on the ESP32
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
@@ -100,7 +95,7 @@ fn main() {
         .map(|s| s.to_string());
 
     // display driver
-    let display = DisplayDriver::new(status_ws2812, screen_ws2811);
+    let display = DisplayDriver::new(led_strip);
 
     // enter wireless setup if requested or if we're missing the wireless config
     if wap_mode == 1 || ssid.is_none() {
