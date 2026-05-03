@@ -21,10 +21,12 @@ opt-level = "z"
 
 [dependencies]
 log = "0.4"
+smart-leds = "0.4.0"
+
+[target.'cfg(target_os = "espidf")'.dependencies]
 embedded-svc = "=0.28.1"
 esp-idf-hal = "0.45"
 esp-idf-svc = { version = "0.51.0", features = ["critical-section"] }
-smart-leds = "0.4.0"
 ws2812-esp32-rmt-driver = { version = "0.13.1", features = ["smart-leds-trait"] }
 
 [build-dependencies]

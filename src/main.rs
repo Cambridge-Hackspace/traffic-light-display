@@ -1,61 +1,47 @@
 mod display;
 
 use display::DisplayDriver;
-use embedded_svc::http::Headers;
-use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::gpio::{PinDriver, Pull};
-use esp_idf_hal::io::{Read, Write};
-use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer};
-use esp_idf_svc::http::Method;
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
-use esp_idf_svc::wifi::{
-    AccessPointConfiguration, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
-};
-use smart_leds::{SmartLedsWrite, RGB8};
+use smart_leds::RGB8;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
-use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
+#[cfg(target_os = "espidf")]
+use {
+    embedded_svc::http::Headers,
+    esp_idf_hal::delay::FreeRtos,
+    esp_idf_hal::gpio::{PinDriver, Pull},
+    esp_idf_hal::io::{Read, Write},
+    esp_idf_hal::peripherals::Peripherals,
+    esp_idf_svc::eventloop::EspSystemEventLoop,
+    esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer},
+    esp_idf_svc::http::Method,
+    esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs},
+    esp_idf_svc::wifi::{
+        AccessPointConfiguration, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
+    },
+    ws2812_esp32_rmt_driver::Ws2812Esp32Rmt,
+};
+
+// --------------------------------------------------------
+// ESP32 ENTRY POINT
+// --------------------------------------------------------
+#[cfg(target_os = "espidf")]
 fn main() {
     esp_idf_svc::sys::link_patches();
 
     println!("> hello, world");
 
-    // set up LED strip -- pin D13 on the ESP32
     let peripherals = Peripherals::take().unwrap();
-    let led_pin = peripherals.pins.gpio13;
-    let channel = peripherals.rmt.channel0;
-    let mut ws2812 = Ws2812Esp32Rmt::new(channel, led_pin).unwrap();
 
-    // boot test
-    let pixels = [RGB8::new(50, 0, 0); 20];
-    match ws2812.write(pixels.iter().cloned()) {
-        Ok(_) => println!("> signal sent successfully"),
-        Err(e) => println!("> ws2812 write error: {:?}", e),
-    }
-    FreeRtos::delay_ms(3000);
+    // set up status LED strip -- pin D13 on the ESP32
+    let status_pin = peripherals.pins.gpio13;
+    let status_channel = peripherals.rmt.channel0;
+    let status_ws2812 = Ws2812Esp32Rmt::new(status_channel, status_pin).unwrap();
 
-    // WS2811 string -- pin D12 on the ESP32
-    let string_pin = peripherals.pins.gpio12;
-    let string_channel = peripherals.rmt.channel1;
-    let mut ws2811 = Ws2812Esp32Rmt::new(string_channel, string_pin).unwrap();
-
-    let _ = std::thread::Builder::new().stack_size(4096).spawn(move || {
-        let mut toggle = false;
-        loop {
-            let color = if toggle {
-                RGB8::new(100, 100, 100)
-            } else {
-                RGB8::new(0, 0, 0)
-            };
-            let pixels = [color; 100];
-            let _ = ws2811.write(pixels.iter().cloned());
-            toggle = !toggle;
-            FreeRtos::delay_ms(500);
-        }
-    });
+    // set up main screen panels -- pin D15 on the ESP32
+    let screen_pin = peripherals.pins.gpio15;
+    let screen_channel = peripherals.rmt.channel1;
+    let screen_ws2811 = Ws2812Esp32Rmt::new(screen_channel, screen_pin).unwrap();
 
     // set up non-volatile storage on the ESP32
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
@@ -113,21 +99,14 @@ fn main() {
         .unwrap_or(None)
         .map(|s| s.to_string());
 
-    let colors = [
-        RGB8::new(195, 78, 75),  // red
-        RGB8::new(61, 132, 175), // blue
-        RGB8::new(216, 163, 0),  // yellow
-        RGB8::new(137, 177, 8),  // green
-    ];
-
     // display driver
-    let display = DisplayDriver::new(ws2812);
+    let display = DisplayDriver::new(status_ws2812, screen_ws2811);
 
     // enter wireless setup if requested or if we're missing the wireless config
     if wap_mode == 1 || ssid.is_none() {
         println!("> activating access point");
         display.set_status_color(RGB8::new(0, 0, 50));
-        display.set_image(&[100; 192]);
+        display.set_image(&[100; 300]);
         run_ap_mode(&mut wifi, nvs_partition.clone());
     } else {
         // connect to the wifi
@@ -159,16 +138,33 @@ fn main() {
         if !connected {
             println!("> failed to connect; re-entering ap mode");
             display.set_status_color(RGB8::new(50, 0, 0));
-            display.set_image(&[100; 192]);
+            display.set_image(&[100; 300]);
             run_ap_mode(&mut wifi, nvs_partition.clone());
         } else {
             println!("> connected successfully");
             display.set_status_color(RGB8::new(0, 50, 0));
-            display.set_image(&[100; 192]);
+            display.set_image(&[100; 300]);
             FreeRtos::delay_ms(2000);
         }
     }
 
+    run_animation_loop(display);
+}
+
+// --------------------------------------------------------
+// NATIVE *NIX ENTRY POINT
+// --------------------------------------------------------
+#[cfg(not(target_os = "espidf"))]
+fn main() {
+    println!("> hello, world");
+    let display = DisplayDriver::new_simulated();
+    run_animation_loop(display);
+}
+
+// --------------------------------------------------------
+// SHARED APPLICATION LOGIC
+// --------------------------------------------------------
+fn run_animation_loop(display: DisplayDriver) {
     println!("> listening for DDP on UDP via port 4048");
 
     let socket = UdpSocket::bind("0.0.0.0:4048").unwrap();
@@ -181,6 +177,13 @@ fn main() {
     let mut last_marquee_update = Instant::now();
     let marquee_text = "CAMBRIDGE HACKSPACE :)     ";
 
+    let colors = [
+        RGB8::new(195, 78, 75),  // red
+        RGB8::new(61, 132, 175), // blue
+        RGB8::new(216, 163, 0),  // yellow
+        RGB8::new(137, 177, 8),  // green
+    ];
+
     // main animation loop
     let mut color_idx = 0;
     let mut last_color_update = Instant::now();
@@ -188,10 +191,10 @@ fn main() {
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, _src)) => {
-                // DDP: 10 byte header + 192 byte payload
-                if len >= 202 {
-                    let mut img = [0u8; 192];
-                    img.copy_from_slice(&buf[10..202]);
+                // DDP: 10 byte header + 300 byte payload
+                if len >= 310 {
+                    let mut img = [0u8; 300];
+                    img.copy_from_slice(&buf[10..310]);
                     display.set_image(&img);
                     last_packet = Instant::now();
                 }
@@ -204,7 +207,7 @@ fn main() {
 
         if now.duration_since(last_packet) > timeout {
             if now.duration_since(last_marquee_update) > Duration::from_millis(100) {
-                let mut img = [0u8; 192];
+                let mut img = [0u8; 300];
                 render_marquee(marquee_text, marquee_offset, &mut img);
                 display.set_image(&img);
                 marquee_offset = (marquee_offset + 1) % (marquee_text.len() * 6);
@@ -218,10 +221,12 @@ fn main() {
             last_color_update = now;
         }
 
-        FreeRtos::delay_ms(10);
+        // FreeRtos::delay_ms(10);
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
+#[cfg(target_os = "espidf")]
 fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition) {
     println!("> scanning for wifi networks...");
 
@@ -448,7 +453,7 @@ fn urldecode(input: &str) -> String {
     out
 }
 
-fn render_marquee(text: &str, offset: usize, img: &mut [u8; 192]) {
+fn render_marquee(text: &str, offset: usize, img: &mut [u8; 300]) {
     let bytes = text.as_bytes();
     let len = bytes.len();
     if len == 0 {
@@ -456,7 +461,7 @@ fn render_marquee(text: &str, offset: usize, img: &mut [u8; 192]) {
     }
 
     let total_width = len * 6;
-    for x in 0..24 {
+    for x in 0..30 {
         let text_x = (x + offset) % total_width;
         let char_idx = text_x / 6;
         let pixel_x = text_x % 6;
@@ -475,7 +480,7 @@ fn render_marquee(text: &str, offset: usize, img: &mut [u8; 192]) {
 
             for y in 0..7 {
                 if (col_data & (1 << y)) != 0 {
-                    img[y * 24 + x] = 100; // max brightness
+                    img[(y + 1) * 30 + x] = 100; // max brightness; + 1 to center vertically
                 }
             }
         }

@@ -1,10 +1,12 @@
+#[cfg(target_os = "espidf")]
 use esp_idf_hal::delay::FreeRtos;
+#[cfg(target_os = "espidf")]
 use smart_leds::{SmartLedsWrite, RGB8};
 use std::sync::{Arc, Mutex};
 
 pub struct DisplayState {
     status_color: RGB8,
-    image: [u8; 192],
+    image: [u8; 300],
 }
 
 #[derive(Clone)]
@@ -13,14 +15,20 @@ pub struct DisplayDriver {
 }
 
 impl DisplayDriver {
-    pub fn new<W>(mut ws2812: W) -> Self
+    // --------------------------------------------------------
+    // HARDWARE INITIALIZER (ESP32 ONLY)
+    // --------------------------------------------------------
+    #[cfg(target_os = "espidf")]
+    pub fn new<W1, W2>(mut status_leds: W1, mut screen_leds: W2) -> Self
     where
-        W: SmartLedsWrite<Color = RGB8> + Send + 'static,
-        W::Error: std::fmt::Debug,
+        W1: SmartLedsWrite<Color = RGB8> + Send + 'static,
+        W1::Error: std::fmt::Debug,
+        W2: SmartLedsWrite<Color = RGB8> + Send + 'static,
+        W2::Error: std::fmt::Debug,
     {
         let state = Arc::new(Mutex::new(DisplayState {
             status_color: RGB8::default(),
-            image: [0; 192],
+            image: [0; 300],
         }));
 
         let state_clone = state.clone();
@@ -29,7 +37,8 @@ impl DisplayDriver {
             let mut tick: usize = 0;
             let brightnesses: [u8; 8] = [12, 18, 24, 31, 42, 56, 75, 100];
 
-            let mut pixels = [RGB8::default(); 199];
+            let mut status_pixels = [RGB8::default(); 8];
+            let mut screen_pixels = [RGB8::default(); 300];
 
             loop {
                 let (status_color, image) = {
@@ -40,22 +49,25 @@ impl DisplayDriver {
                 // sliding gradient on status LEDs
                 for i in 0..8 {
                     let b = brightnesses[(8 + i - (tick % 8)) % 8];
-                    pixels[i] = Self::scale_color(status_color, b);
+                    status_pixels[i] = Self::scale_color(status_color, b);
                 }
 
-                // map 24x8 grayscale logical image to physical serpentine grid
-                for y in 0..8 {
-                    for x in 0..24 {
+                // map 30x10 grayscale logical image to physical serpentine grid
+                for y in 0..10 {
+                    for x in 0..30 {
                         if let Some(idx) = Self::get_pixel_index(x, y) {
-                            let val = image[y * 24 + x];
-                            pixels[idx] = RGB8::new(val, val, val);
+                            let val = image[y * 30 + x];
+                            screen_pixels[idx] = RGB8::new(val, val, val);
                         }
                     }
                 }
 
                 // write mapped array to physical strip
-                if let Err(e) = ws2812.write(pixels.iter().cloned()) {
-                    println!("> ws2812 write error: {:?}", e);
+                if let Err(e) = status_leds.write(status_pixels.iter().cloned()) {
+                    println!("> status ws2812 write error: {:?}", e);
+                }
+                if let Err(e) = screen_leds.write(screen_pixels.iter().cloned()) {
+                    println!("> screen ws2811 write error: {:?}", e);
                 }
 
                 tick = tick.wrapping_add(1);
@@ -66,13 +78,26 @@ impl DisplayDriver {
         Self { state }
     }
 
+    // --------------------------------------------------------
+    // SIMULATOR INITIALIZER (*NIX ONLY)
+    // --------------------------------------------------------
+    #[cfg(not(target_os = "espidf"))]
+    pub fn new_simulated() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DisplayState {
+                status_color: RGB8::default(),
+                image: [0; 300],
+            })),
+        }
+    }
+
     pub fn set_status_color(&self, color: RGB8) {
         if let Ok(mut lock) = self.state.lock() {
             lock.status_color = color;
         }
     }
 
-    pub fn set_image(&self, image: &[u8; 192]) {
+    pub fn set_image(&self, image: &[u8; 300]) {
         if let Ok(mut lock) = self.state.lock() {
             #[cfg(feature = "console-sim")]
             if lock.image != *image {
@@ -90,33 +115,31 @@ impl DisplayDriver {
         )
     }
 
-    fn get_pixel_index(x: usize, y: usize) -> Option<usize> {
-        // transform x-coordinates where x=23 is the first physical column (c=0)
-        let c = 23 - x;
+    fn get_pixel_index(lx: usize, ly: usize) -> Option<usize> {
+        // translate logical coordinates to the physical matrix orientation
+        let (px, py) = match lx {
+            0..=9 => (lx, ly),        // panel 0: normal
+            10..=19 => (29 - lx, ly), // panel 1: mirrored horizontally
+            20..=29 => (49 - lx, ly), // panel 2: rotated by 180 degrees
+            _ => return None,
+        };
 
-        // first physical column on the right (missing top pixel)
-        if c == 0 {
-            if y == 0 {
-                return None; // missing pixel
-            }
-            return Some(8 + (y - 1));
-        }
+        // transform x-coordinates where x = 29 is the first physical column (c=0)
+        let c = 29 - px;
 
-        // remaining columns
-        let base = 15 + (c - 1) * 8;
-        let offset = if c % 2 == 0 { y } else { 7 - y }; // serpentine
-
-        Some(base + offset)
+        // serpentine vertical mapping
+        let offset = if c % 2 == 0 { py } else { 9 - py };
+        Some(c * 10 + offset)
     }
 
     #[cfg(feature = "console-sim")]
-    fn print_sim(image: &[u8; 192]) {
-        let mut out = String::with_capacity(24 * 8 * 3 + 100);
-        out.push_str("\n+------------------------------------------------+\n");
-        for y in 0..8 {
+    fn print_sim(image: &[u8; 300]) {
+        let mut out = String::with_capacity(30 * 10 * 3 + 100);
+        out.push_str("\n+------------------------------------------------------------+\n");
+        for y in 0..10 {
             out.push('|');
-            for x in 0..24 {
-                let val = image[y * 24 + x];
+            for x in 0..30 {
+                let val = image[y * 30 + x];
                 let c = match val {
                     0..=5 => "  ",
                     6..=25 => "░░",
@@ -128,7 +151,7 @@ impl DisplayDriver {
             }
             out.push_str("|\n");
         }
-        out.push_str("+------------------------------------------------+\n");
+        out.push_str("\n+------------------------------------------------------------+\n");
         print!("{}", out);
     }
 }

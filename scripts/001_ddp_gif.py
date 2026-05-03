@@ -10,9 +10,9 @@ except ImportError:
     print(f"Error: Pillow library is required.")
     sys.exit(1)
 
-DDP_HEADER = bytearray([0x41, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0])
-DISPLAY_WIDTH = 24
-DISPLAY_HEIGHT = 8
+DDP_HEADER = bytearray([0x41, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x2C])
+DISPLAY_WIDTH = 30
+DISPLAY_HEIGHT = 10
 
 def process_gif(gif_path):
     try:
@@ -32,7 +32,7 @@ def process_gif(gif_path):
         bg = Image.new("RGBA", rgba_frame.size, (0, 0, 0, 255))
         bg.paste(rgba_frame, mask=rgba_frame)
 
-        # convert to RGB, then use ImageOps.pad to fit the frame into 24x8 w/o
+        # convert to RGB, then use ImageOps.pad to fit the frame into 30/10 w/o
         # stretching; any leftover space is filled with black pixels
         rgb_frame = bg.convert("RGB")
         resized = ImageOps.pad(rgb_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT), color=(0, 0, 0))
@@ -46,7 +46,7 @@ def process_gif(gif_path):
         if duration == 0:
             duration = 100
 
-        # convert grayscale image data to a flat bytearray (192 bytes)
+        # convert grayscale image data to a flat bytearray (300 bytes)
         payload = bytearray(gray.getdata())
 
         # store the payload alongside its intended udration (in seconds for time.sleep)
