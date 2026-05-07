@@ -36,6 +36,7 @@ impl DisplayDriver {
         #[cfg(target_os = "espidf")]
         ThreadSpawnConfiguration {
             pin_to_core: Some(Core::Core1),
+            priority: 15,
             ..Default::default()
         }
         .set()

@@ -120,6 +120,10 @@ fn main() {
         wifi.start().unwrap();
         wifi.connect().unwrap();
 
+        unsafe {
+            esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE);
+        }
+
         let mut connected = false;
         for _ in 0..100 {
             // 10 second timeout
