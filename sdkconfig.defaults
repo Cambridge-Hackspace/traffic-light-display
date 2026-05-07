@@ -14,3 +14,22 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 # HTTP configurations
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=1024
+
+# Keep RMT interrupts in fast internal RAM (IRAM) to prevent starvation during Wi-Fi flash access
+CONFIG_RMT_ISR_IRAM_SAFE=y
+CONFIG_ESP_SYSTEM_EVENT_TASK_PINNED_TO_CORE_1=y
+
+# Max out the CPU Frequency
+# Processes the RMT refill interrupts as fast as physically possible
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# Move Wi-Fi Memory to IRAM
+# Forces the Wi-Fi stack to use internal RAM instead of external Flash. 
+# This prevents the Wi-Fi radio from disabling the Flash cache during network activity.
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+
+# Increase FreeRTOS Tick Rate
+# Gives the RTOS finer timing resolution for context switching
+CONFIG_FREERTOS_HZ=1000

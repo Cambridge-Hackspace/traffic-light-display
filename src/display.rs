@@ -1,6 +1,8 @@
 #[cfg(target_os = "espidf")]
 use esp_idf_hal::delay::FreeRtos;
 #[cfg(target_os = "espidf")]
+use esp_idf_hal::{cpu::Core, task::thread::ThreadSpawnConfiguration};
+#[cfg(target_os = "espidf")]
 use smart_leds::{SmartLedsWrite, RGB8};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +32,14 @@ impl DisplayDriver {
         }));
 
         let state_clone = state.clone();
+
+        #[cfg(target_os = "espidf")]
+        ThreadSpawnConfiguration {
+            pin_to_core: Some(Core::Core1),
+            ..Default::default()
+        }
+        .set()
+        .ok();
 
         std::thread::spawn(move || {
             let mut tick: usize = 0;
@@ -65,7 +75,7 @@ impl DisplayDriver {
                 }
 
                 tick = tick.wrapping_add(1);
-                FreeRtos::delay_ms(125);
+                FreeRtos::delay_ms(33);
             }
         });
 
