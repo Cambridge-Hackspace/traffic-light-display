@@ -98,52 +98,54 @@ fn main() {
     let display = DisplayDriver::new(led_strip);
 
     // enter wireless setup if requested or if we're missing the wireless config
-    if wap_mode == 1 || ssid.is_none() {
-        println!("> activating access point");
-        display.set_status_color(RGB8::new(0, 0, 50));
-        display.set_image(&[100; 300]);
-        run_ap_mode(&mut wifi, nvs_partition.clone());
-    } else {
-        // connect to the wifi
-        let s = ssid.unwrap();
-        let p = pass.unwrap_or_default();
+    match ssid {
+        Some(s) if wap_mode != 1 => {
+            // connect to the wifi
+            let p = pass.unwrap_or_default();
 
-        wifi.set_configuration(&WifiConfiguration::Client(ClientConfiguration {
-            ssid: s.as_str().try_into().unwrap(),
-            password: p.as_str().try_into().unwrap(),
-            ..Default::default()
-        }))
-        .unwrap();
+            wifi.set_configuration(&WifiConfiguration::Client(ClientConfiguration {
+                ssid: s.as_str().try_into().unwrap(),
+                password: p.as_str().try_into().unwrap(),
+                ..Default::default()
+            }))
+            .unwrap();
 
-        println!("> attempting to connect to wifi");
+            println!("> attempting to connect to wifi");
 
-        wifi.start().unwrap();
-        wifi.connect().unwrap();
+            wifi.start().unwrap();
+            wifi.connect().unwrap();
 
-        unsafe {
-            esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE);
-        }
-
-        let mut connected = false;
-        for _ in 0..100 {
-            // 10 second timeout
-            if wifi.is_connected().unwrap_or(false) {
-                connected = true;
-                break;
+            unsafe {
+                esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE);
             }
-            FreeRtos::delay_ms(100);
-        }
 
-        if !connected {
-            println!("> failed to connect; re-entering ap mode");
-            display.set_status_color(RGB8::new(50, 0, 0));
+            let mut connected = false;
+            for _ in 0..100 {
+                // 10 second timeout
+                if wifi.is_connected().unwrap_or(false) {
+                    connected = true;
+                    break;
+                }
+                FreeRtos::delay_ms(100);
+            }
+
+            if !connected {
+                println!("> failed to connect; re-entering ap mode");
+                display.set_status_color(RGB8::new(50, 0, 0));
+                display.set_image(&[100; 300]);
+                run_ap_mode(&mut wifi, nvs_partition.clone());
+            } else {
+                println!("> connected successfully");
+                display.set_status_color(RGB8::new(0, 50, 0));
+                display.set_image(&[100; 300]);
+                FreeRtos::delay_ms(2000);
+            }
+        }
+        _ => {
+            println!("> activating access point");
+            display.set_status_color(RGB8::new(0, 0, 50));
             display.set_image(&[100; 300]);
             run_ap_mode(&mut wifi, nvs_partition.clone());
-        } else {
-            println!("> connected successfully");
-            display.set_status_color(RGB8::new(0, 50, 0));
-            display.set_image(&[100; 300]);
-            FreeRtos::delay_ms(2000);
         }
     }
 
@@ -204,14 +206,14 @@ fn run_animation_loop(display: DisplayDriver) {
 
         let now = Instant::now();
 
-        if now.duration_since(last_packet) > timeout {
-            if now.duration_since(last_marquee_update) > Duration::from_millis(100) {
-                let mut img = [0u8; 300];
-                render_marquee(marquee_text, marquee_offset, &mut img);
-                display.set_image(&img);
-                marquee_offset = (marquee_offset + 1) % (marquee_text.len() * 6);
-                last_marquee_update = now;
-            }
+        if now.duration_since(last_packet) > timeout
+            && now.duration_since(last_marquee_update) > Duration::from_millis(100)
+        {
+            let mut img = [0u8; 300];
+            render_marquee(marquee_text, marquee_offset, &mut img);
+            display.set_image(&img);
+            marquee_offset = (marquee_offset + 1) % (marquee_text.len() * 6);
+            last_marquee_update = now;
         }
 
         if now.duration_since(last_color_update) > Duration::from_millis(1000) {
@@ -467,10 +469,10 @@ fn render_marquee(text: &str, offset: usize, img: &mut [u8; 300]) {
 
         if pixel_x < 5 {
             let mut c = bytes[char_idx];
-            if c >= 97 && c <= 122 {
+            if (97..=122).contains(&c) {
                 c -= 32; // basic uppercase conversion
             }
-            if c < 32 || c >= 97 {
+            if !(32..97).contains(&c) {
                 c = 32;
             }
 
