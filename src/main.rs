@@ -13,6 +13,7 @@ use {
     esp_idf_hal::io::{Read, Write},
     esp_idf_hal::peripherals::Peripherals,
     esp_idf_svc::eventloop::EspSystemEventLoop,
+    esp_idf_svc::handle::RawHandle,
     esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer},
     esp_idf_svc::http::Method,
     esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs},
@@ -109,6 +110,14 @@ fn main() {
                 ..Default::default()
             }))
             .unwrap();
+
+            // set hostname
+            unsafe {
+                esp_idf_svc::sys::esp_netif_set_hostname(
+                    wifi.sta_netif().handle() as *mut _,
+                    b"traffic-light\0".as_ptr() as _,
+                );
+            }
 
             println!("> attempting to connect to wifi");
 
