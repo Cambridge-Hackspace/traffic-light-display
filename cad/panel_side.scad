@@ -11,7 +11,8 @@ difference() {
       box_depth + wire_grace,  // total inner depth
       box_height,              // box height
       tooth_sz, tooth_sz,      // teeth are square
-      true                     // top and bottom have negative corners
+      true,                    // top and bottom have negative teeth
+      true                     // sides have standard teeth
   );
   
   logo_sz = box_height < box_depth + wire_grace ? box_height : box_depth + wire_grace; 

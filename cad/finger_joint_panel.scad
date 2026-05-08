@@ -24,23 +24,23 @@ module teeth(tooth_width, tooth_depth, run_length, invert_teeth=false) {
   }
 }
 
-module panel(panel_length, panel_width, tooth_width, tooth_depth, invert_teeth=false) {
+module panel(panel_length, panel_width, tooth_width, tooth_depth, invert_teeth=false, alternate_inversion=false) {
 
  tooth_count = floor(panel_width / (2 * tooth_width) - 1);
  tooth_offset = (panel_width - (tooth_count * 2 * tooth_width) - tooth_width) / 2;
  
  square([panel_length, panel_width]);
  transforms = ([
-     [panel_length, 0, 0, 0],
-     [panel_length, 0, 0, panel_width + tooth_depth],
-     [panel_width, 90, -tooth_depth, 0],
-     [panel_width, 90, panel_length, 0]
+     [panel_length, 0, 0, 0, invert_teeth],
+     [panel_length, 0, 0, panel_width + tooth_depth, invert_teeth],
+     [panel_width, 90, -tooth_depth, 0, invert_teeth != alternate_inversion],
+     [panel_width, 90, panel_length, 0, invert_teeth != alternate_inversion]
  ]);
  for(i = [0 : 3]) {
    transform = transforms[i];
    translate([transform[2], transform[3]]) {
      rotate([0, 0, transform[1]]) {
-       teeth(tooth_width, tooth_depth, transform[0], invert_teeth);
+       teeth(tooth_width, tooth_depth, transform[0], transform[4]);
      }
    }
  }
