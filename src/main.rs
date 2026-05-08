@@ -3,6 +3,7 @@ mod display;
 use display::DisplayDriver;
 use smart_leds::RGB8;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "espidf")]
@@ -22,6 +23,9 @@ use {
     },
     ws2812_esp32_rmt_driver::Ws2812Esp32Rmt,
 };
+
+// global state to track if the display should be flipped
+static INVERT_DISPLAY: AtomicBool = AtomicBool::new(false);
 
 // --------------------------------------------------------
 // ESP32 ENTRY POINT
@@ -47,11 +51,17 @@ fn main() {
     let mut boot_btn = PinDriver::input(peripherals.pins.gpio0).unwrap();
     boot_btn.set_pull(Pull::Up).unwrap();
 
+    // set up display inversion switch on GPIO 4
+    let mut display_flip_pin = PinDriver::input(peripherals.pins.gpio4).unwrap();
+    display_flip_pin.set_pull(Pull::Up).unwrap();
+
     // if the BOOT button is pressed for 5+ seconds, request wireless setup
     let nvs_part_clone = nvs_partition.clone();
     let _ = std::thread::Builder::new().stack_size(8192).spawn(move || {
         let mut pressed_time = 0;
         loop {
+            INVERT_DISPLAY.store(display_flip_pin.is_low(), Ordering::Relaxed);
+
             if boot_btn.is_low() {
                 pressed_time += 1;
                 if pressed_time >= 50 {
@@ -205,6 +215,9 @@ fn run_animation_loop(display: DisplayDriver) {
                 if len >= 310 {
                     let mut img = [0u8; 300];
                     img.copy_from_slice(&buf[10..310]);
+                    if INVERT_DISPLAY.load(Ordering::Relaxed) {
+                        rotate_image_180(&mut img);
+                    }
                     display.set_image(&img);
                     last_packet = Instant::now();
                 }
@@ -220,6 +233,9 @@ fn run_animation_loop(display: DisplayDriver) {
         {
             let mut img = [0u8; 300];
             render_marquee(marquee_text, marquee_offset, &mut img);
+            if INVERT_DISPLAY.load(Ordering::Relaxed) {
+                rotate_image_180(&mut img);
+            }
             display.set_image(&img);
             marquee_offset = (marquee_offset + 1) % (marquee_text.len() * 6);
             last_marquee_update = now;
@@ -564,3 +580,13 @@ const FONT: [u8; 325] = [
     0x40, 0x40, 0x40, 0x40, 0x40, // 95 _
     0x00, 0x01, 0x02, 0x04, 0x00, // 96 `
 ];
+
+fn rotate_image_180(img: &mut [u8; 300]) {
+    let mut temp = [0u8; 300];
+    temp.copy_from_slice(img);
+    for y in 0..10 {
+        for x in 0..30 {
+            img[y * 30 + x] = temp[(9 - y) * 30 + (29 - x)];
+        }
+    }
+}
