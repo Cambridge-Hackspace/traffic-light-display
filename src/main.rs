@@ -115,7 +115,7 @@ fn main() {
             unsafe {
                 esp_idf_svc::sys::esp_netif_set_hostname(
                     wifi.sta_netif().handle() as *mut _,
-                    b"traffic-light\0".as_ptr() as _,
+                    c"traffic-light".as_ptr() as _,
                 );
             }
 
