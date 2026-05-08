@@ -1,28 +1,47 @@
-use embedded_svc::http::Headers;
-use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::gpio::{PinDriver, Pull};
-use esp_idf_hal::io::{Read, Write};
-use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer};
-use esp_idf_svc::http::Method;
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
-use esp_idf_svc::wifi::{
-    AccessPointConfiguration, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
-};
-use smart_leds::{SmartLedsWrite, RGB8};
-use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
+mod display;
 
+use display::DisplayDriver;
+use smart_leds::RGB8;
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "espidf")]
+use {
+    embedded_svc::http::Headers,
+    esp_idf_hal::delay::FreeRtos,
+    esp_idf_hal::gpio::{PinDriver, Pull},
+    esp_idf_hal::io::{Read, Write},
+    esp_idf_hal::peripherals::Peripherals,
+    esp_idf_svc::eventloop::EspSystemEventLoop,
+    esp_idf_svc::handle::RawHandle,
+    esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer},
+    esp_idf_svc::http::Method,
+    esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs},
+    esp_idf_svc::wifi::{
+        AccessPointConfiguration, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
+    },
+    ws2812_esp32_rmt_driver::Ws2812Esp32Rmt,
+};
+
+// global state to track if the display should be flipped
+static INVERT_DISPLAY: AtomicBool = AtomicBool::new(false);
+
+// --------------------------------------------------------
+// ESP32 ENTRY POINT
+// --------------------------------------------------------
+#[cfg(target_os = "espidf")]
 fn main() {
     esp_idf_svc::sys::link_patches();
 
     println!("> hello, world");
 
-    // set up LED strip -- pin D13 on the ESP32
     let peripherals = Peripherals::take().unwrap();
+
+    // set up combined LED strip (status + screen) - pin D13 on the ESP32
     let led_pin = peripherals.pins.gpio13;
-    let channel = peripherals.rmt.channel0;
-    let mut ws2812 = Ws2812Esp32Rmt::new(channel, led_pin).unwrap();
+    let led_channel = peripherals.rmt.channel0;
+    let led_strip = Ws2812Esp32Rmt::new(led_channel, led_pin).unwrap();
 
     // set up non-volatile storage on the ESP32
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
@@ -32,11 +51,17 @@ fn main() {
     let mut boot_btn = PinDriver::input(peripherals.pins.gpio0).unwrap();
     boot_btn.set_pull(Pull::Up).unwrap();
 
+    // set up display inversion switch on GPIO 4
+    let mut display_flip_pin = PinDriver::input(peripherals.pins.gpio4).unwrap();
+    display_flip_pin.set_pull(Pull::Up).unwrap();
+
     // if the BOOT button is pressed for 5+ seconds, request wireless setup
     let nvs_part_clone = nvs_partition.clone();
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().stack_size(8192).spawn(move || {
         let mut pressed_time = 0;
         loop {
+            INVERT_DISPLAY.store(display_flip_pin.is_low(), Ordering::Relaxed);
+
             if boot_btn.is_low() {
                 pressed_time += 1;
                 if pressed_time >= 50 {
@@ -80,105 +105,154 @@ fn main() {
         .unwrap_or(None)
         .map(|s| s.to_string());
 
-    let colors = [
-        RGB8::new(50, 0, 0),   // red
-        RGB8::new(0, 50, 0),   // green
-        RGB8::new(0, 0, 50),   // blue
-        RGB8::new(50, 50, 0),  // yellow
-        RGB8::new(50, 0, 50),  // magenta
-        RGB8::new(0, 50, 50),  // cyan
-        RGB8::new(50, 50, 50), // white
-    ];
-
-    let mut pixels = [RGB8::default(); 199];
+    // display driver
+    let display = DisplayDriver::new(led_strip);
 
     // enter wireless setup if requested or if we're missing the wireless config
-    if wap_mode == 1 || ssid.is_none() {
-        println!("> activating access point");
-        for i in 0..8 {
-            pixels[i] = RGB8::new(0, 0, 50);
-        }
-        for i in 8..199 {
-            pixels[i] = RGB8::new(100, 100, 100);
-        }
-        ws2812.write(pixels.iter().cloned()).unwrap();
-        run_ap_mode(&mut wifi, nvs_partition.clone());
-    } else {
-        // connect to the wifi
-        let s = ssid.unwrap();
-        let p = pass.unwrap_or_default();
+    match ssid {
+        Some(s) if wap_mode != 1 => {
+            // connect to the wifi
+            let p = pass.unwrap_or_default();
 
-        wifi.set_configuration(&WifiConfiguration::Client(ClientConfiguration {
-            ssid: s.as_str().try_into().unwrap(),
-            password: p.as_str().try_into().unwrap(),
-            ..Default::default()
-        }))
-        .unwrap();
+            wifi.set_configuration(&WifiConfiguration::Client(ClientConfiguration {
+                ssid: s.as_str().try_into().unwrap(),
+                password: p.as_str().try_into().unwrap(),
+                ..Default::default()
+            }))
+            .unwrap();
 
-        println!("> attempting to connect to wifi");
-
-        wifi.start().unwrap();
-        wifi.connect().unwrap();
-
-        let mut connected = false;
-        for _ in 0..100 {
-            // 10 second timeout
-            if wifi.is_connected().unwrap_or(false) {
-                connected = true;
-                break;
+            // set hostname
+            unsafe {
+                esp_idf_svc::sys::esp_netif_set_hostname(
+                    wifi.sta_netif().handle() as *mut _,
+                    c"traffic-light".as_ptr() as _,
+                );
             }
-            FreeRtos::delay_ms(100);
-        }
 
-        if !connected {
-            println!("> failed to connect; re-entering ap mode");
-            for i in 0..8 {
-                pixels[i] = RGB8::new(50, 0, 0);
+            println!("> attempting to connect to wifi");
+
+            wifi.start().unwrap();
+            wifi.connect().unwrap();
+
+            unsafe {
+                esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE);
             }
-            ws2812.write(pixels.iter().cloned()).unwrap();
+
+            let mut connected = false;
+            for _ in 0..100 {
+                // 10 second timeout
+                if wifi.is_connected().unwrap_or(false) {
+                    connected = true;
+                    break;
+                }
+                FreeRtos::delay_ms(100);
+            }
+
+            if !connected {
+                println!("> failed to connect; re-entering ap mode");
+                display.set_status_color(RGB8::new(50, 0, 0));
+                display.set_image(&[100; 300]);
+                run_ap_mode(&mut wifi, nvs_partition.clone());
+            } else {
+                println!("> connected successfully");
+                display.set_status_color(RGB8::new(0, 50, 0));
+                display.set_image(&[100; 300]);
+                FreeRtos::delay_ms(2000);
+            }
+        }
+        _ => {
+            println!("> activating access point");
+            display.set_status_color(RGB8::new(0, 0, 50));
+            display.set_image(&[100; 300]);
             run_ap_mode(&mut wifi, nvs_partition.clone());
-        } else {
-            println!("> connected successfully");
-            for i in 0..199 {
-                pixels[i] = RGB8::new(0, 50, 0);
-            }
-            ws2812.write(pixels.iter().cloned()).unwrap();
-            FreeRtos::delay_ms(2000);
         }
     }
 
-    println!("> launching animation");
+    run_animation_loop(display);
+}
 
-    for i in 0..199 {
-        pixels[i] = RGB8::new(100, 100, 100); // bright white
-        ws2812.write(pixels.iter().cloned()).unwrap();
-    }
+// --------------------------------------------------------
+// NATIVE *NIX ENTRY POINT
+// --------------------------------------------------------
+#[cfg(not(target_os = "espidf"))]
+fn main() {
+    println!("> hello, world");
+    let display = DisplayDriver::new_simulated();
+    run_animation_loop(display);
+}
+
+// --------------------------------------------------------
+// SHARED APPLICATION LOGIC
+// --------------------------------------------------------
+fn run_animation_loop(display: DisplayDriver) {
+    println!("> listening for DDP on UDP via port 4048");
+
+    let socket = UdpSocket::bind("0.0.0.0:4048").unwrap();
+    socket.set_nonblocking(true).unwrap();
+
+    let mut buf = [0u8; 1500];
+    let timeout = Duration::from_secs(5);
+    let mut last_packet = Instant::now() - timeout;
+    let mut marquee_offset = 0;
+    let mut last_marquee_update = Instant::now();
+    let marquee_text = "CAMBRIDGE HACKSPACE :)     ";
+
+    let colors = [
+        RGB8::new(195, 78, 75),  // red
+        RGB8::new(61, 132, 175), // blue
+        RGB8::new(216, 163, 0),  // yellow
+        RGB8::new(137, 177, 8),  // green
+    ];
 
     // main animation loop
-    loop {
-        // for each of the first 8 LEDs
-        for i in 0..8 {
-            // for each color
-            for color in colors.iter() {
-                // shut off all LEDs
-                for j in 0..8 {
-                    pixels[j] = RGB8::default();
-                }
-                // activate ONLY the current LED
-                pixels[i] = *color;
-                // push the data array to the physical strip
-                ws2812.write(pixels.iter().cloned()).unwrap();
-                // wait 142 ms per color (about 1 second per LED)
-                FreeRtos::delay_ms(142);
-            }
+    let mut color_idx = 0;
+    let mut last_color_update = Instant::now();
 
-            // turn off current LED before outer loop moves to next one
-            pixels[i] = RGB8::default();
-            ws2812.write(pixels.iter().cloned()).unwrap();
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _src)) => {
+                // DDP: 10 byte header + 300 byte payload
+                if len >= 310 {
+                    let mut img = [0u8; 300];
+                    img.copy_from_slice(&buf[10..310]);
+                    if INVERT_DISPLAY.load(Ordering::Relaxed) {
+                        rotate_image_180(&mut img);
+                    }
+                    display.set_image(&img);
+                    last_packet = Instant::now();
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // expected on non-blocking
+            Err(_) => {}                                               // expected on read timeout
         }
+
+        let now = Instant::now();
+
+        if now.duration_since(last_packet) > timeout
+            && now.duration_since(last_marquee_update) > Duration::from_millis(100)
+        {
+            let mut img = [0u8; 300];
+            render_marquee(marquee_text, marquee_offset, &mut img);
+            if INVERT_DISPLAY.load(Ordering::Relaxed) {
+                rotate_image_180(&mut img);
+            }
+            display.set_image(&img);
+            marquee_offset = (marquee_offset + 1) % (marquee_text.len() * 6);
+            last_marquee_update = now;
+        }
+
+        if now.duration_since(last_color_update) > Duration::from_millis(1000) {
+            display.set_status_color(colors[color_idx]);
+            color_idx = (color_idx + 1) % colors.len();
+            last_color_update = now;
+        }
+
+        // FreeRtos::delay_ms(10);
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
+#[cfg(target_os = "espidf")]
 fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition) {
     println!("> scanning for wifi networks...");
 
@@ -403,4 +477,116 @@ fn urldecode(input: &str) -> String {
         }
     }
     out
+}
+
+fn render_marquee(text: &str, offset: usize, img: &mut [u8; 300]) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return;
+    }
+
+    let total_width = len * 6;
+    for x in 0..30 {
+        let text_x = (x + offset) % total_width;
+        let char_idx = text_x / 6;
+        let pixel_x = text_x % 6;
+
+        if pixel_x < 5 {
+            let mut c = bytes[char_idx];
+            if (97..=122).contains(&c) {
+                c -= 32; // basic uppercase conversion
+            }
+            if !(32..97).contains(&c) {
+                c = 32;
+            }
+
+            let font_idx = ((c - 32) as usize) * 5 + pixel_x;
+            let col_data = FONT[font_idx];
+
+            for y in 0..7 {
+                if (col_data & (1 << y)) != 0 {
+                    img[(y + 1) * 30 + x] = 100; // max brightness; + 1 to center vertically
+                }
+            }
+        }
+    }
+}
+
+const FONT: [u8; 325] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, // 32 space
+    0x00, 0x00, 0x4f, 0x00, 0x00, // 33 !
+    0x00, 0x07, 0x00, 0x07, 0x00, // 34 "
+    0x14, 0x7f, 0x14, 0x7f, 0x14, // 35 #
+    0x24, 0x2a, 0x7f, 0x2a, 0x12, // 36 $
+    0x23, 0x13, 0x08, 0x64, 0x62, // 37 %
+    0x36, 0x49, 0x55, 0x22, 0x50, // 38 &
+    0x00, 0x05, 0x03, 0x00, 0x00, // 39 '
+    0x00, 0x1c, 0x22, 0x41, 0x00, // 40 (
+    0x00, 0x41, 0x22, 0x1c, 0x00, // 41 )
+    0x14, 0x08, 0x3e, 0x08, 0x14, // 42 *
+    0x08, 0x08, 0x3e, 0x08, 0x08, // 43 +
+    0x00, 0x50, 0x30, 0x00, 0x00, // 44 ,
+    0x08, 0x08, 0x08, 0x08, 0x08, // 45 -
+    0x00, 0x60, 0x60, 0x00, 0x00, // 46 .
+    0x20, 0x10, 0x08, 0x04, 0x02, // 47 /
+    0x3e, 0x51, 0x49, 0x45, 0x3e, // 48 0
+    0x00, 0x42, 0x7f, 0x40, 0x00, // 49 1
+    0x42, 0x61, 0x51, 0x49, 0x46, // 50 2
+    0x21, 0x41, 0x45, 0x4b, 0x31, // 51 3
+    0x18, 0x14, 0x12, 0x7f, 0x10, // 52 4
+    0x27, 0x45, 0x45, 0x45, 0x39, // 53 5
+    0x3c, 0x4a, 0x49, 0x49, 0x30, // 54 6
+    0x01, 0x71, 0x09, 0x05, 0x03, // 55 7
+    0x36, 0x49, 0x49, 0x49, 0x36, // 56 8
+    0x06, 0x49, 0x49, 0x29, 0x1e, // 57 9
+    0x00, 0x36, 0x36, 0x00, 0x00, // 58 :
+    0x00, 0x56, 0x36, 0x00, 0x00, // 59 ;
+    0x08, 0x14, 0x22, 0x41, 0x00, // 60 <
+    0x14, 0x14, 0x14, 0x14, 0x14, // 61 =
+    0x00, 0x41, 0x22, 0x14, 0x08, // 62 >
+    0x02, 0x01, 0x51, 0x09, 0x06, // 63 ?
+    0x32, 0x49, 0x79, 0x41, 0x3e, // 64 @
+    0x7e, 0x11, 0x11, 0x11, 0x7e, // 65 A
+    0x7f, 0x49, 0x49, 0x49, 0x36, // 66 B
+    0x3e, 0x41, 0x41, 0x41, 0x22, // 67 C
+    0x7f, 0x41, 0x41, 0x22, 0x1c, // 68 D
+    0x7f, 0x49, 0x49, 0x49, 0x41, // 69 E
+    0x7f, 0x09, 0x09, 0x09, 0x01, // 70 F
+    0x3e, 0x41, 0x49, 0x49, 0x7a, // 71 G
+    0x7f, 0x08, 0x08, 0x08, 0x7f, // 72 H
+    0x00, 0x41, 0x7f, 0x41, 0x00, // 73 I
+    0x20, 0x40, 0x41, 0x3f, 0x01, // 74 J
+    0x7f, 0x08, 0x14, 0x22, 0x41, // 75 K
+    0x7f, 0x40, 0x40, 0x40, 0x40, // 76 L
+    0x7f, 0x02, 0x0c, 0x02, 0x7f, // 77 M
+    0x7f, 0x04, 0x08, 0x10, 0x7f, // 78 N
+    0x3e, 0x41, 0x41, 0x41, 0x3e, // 79 O
+    0x7f, 0x09, 0x09, 0x09, 0x06, // 80 P
+    0x3e, 0x41, 0x51, 0x21, 0x5e, // 81 Q
+    0x7f, 0x09, 0x19, 0x29, 0x46, // 82 R
+    0x46, 0x49, 0x49, 0x49, 0x31, // 83 S
+    0x01, 0x01, 0x7f, 0x01, 0x01, // 84 T
+    0x3f, 0x40, 0x40, 0x40, 0x3f, // 85 U
+    0x1f, 0x20, 0x40, 0x20, 0x1f, // 86 V
+    0x3f, 0x40, 0x38, 0x40, 0x3f, // 87 W
+    0x63, 0x14, 0x08, 0x14, 0x63, // 88 X
+    0x07, 0x08, 0x70, 0x08, 0x07, // 89 Y
+    0x61, 0x51, 0x49, 0x45, 0x43, // 90 Z
+    0x00, 0x7f, 0x41, 0x41, 0x00, // 91 [
+    0x02, 0x04, 0x08, 0x10, 0x20, // 92 \
+    0x00, 0x41, 0x41, 0x7f, 0x00, // 93 ]
+    0x04, 0x02, 0x01, 0x02, 0x04, // 94 ^
+    0x40, 0x40, 0x40, 0x40, 0x40, // 95 _
+    0x00, 0x01, 0x02, 0x04, 0x00, // 96 `
+];
+
+fn rotate_image_180(img: &mut [u8; 300]) {
+    let mut temp = [0u8; 300];
+    temp.copy_from_slice(img);
+    for y in 0..10 {
+        for x in 0..30 {
+            img[y * 30 + x] = temp[(9 - y) * 30 + (29 - x)];
+        }
+    }
 }
