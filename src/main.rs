@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "espidf")]
 use {
+    embedded_svc::http::server::Request,
     embedded_svc::http::Headers,
     esp_idf_hal::delay::FreeRtos,
     esp_idf_hal::gpio::{PinDriver, Pull},
@@ -34,10 +35,13 @@ use {
     esp_idf_hal::rmt::{config::TransmitConfig, TxRmtDriver},
     esp_idf_svc::eventloop::EspSystemEventLoop,
     esp_idf_svc::handle::RawHandle,
-    esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer},
+    esp_idf_svc::http::server::{
+        Configuration as HttpConfiguration, EspHttpConnection, EspHttpServer,
+    },
     esp_idf_svc::http::Method,
     esp_idf_svc::io::EspIOError,
     esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs},
+    esp_idf_svc::ota::{EspOta, SlotState},
     esp_idf_svc::wifi::{
         AccessPointConfiguration, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
     },
@@ -46,6 +50,11 @@ use {
 
 // Default UDP port for the DDP listener. Overridable via NVS ("listen_port").
 const DEFAULT_LISTEN_PORT: u16 = 4048;
+
+// How many 10-second association attempts a boot gets before it gives up and
+// falls back to setup mode.
+#[cfg(target_os = "espidf")]
+const WIFI_CONNECT_ATTEMPTS: u32 = 3;
 
 // Where the setup portal is being served from. It decides what a Wi-Fi
 // credential change does: in setup mode the access point is torn down for a
@@ -61,6 +70,13 @@ pub enum PortalMode {
 // test-in-place (the setup-mode loop). Absent when there is no one to run it.
 #[cfg(target_os = "espidf")]
 type WifiTestSlot = Arc<Mutex<Option<(String, String)>>>;
+
+// The portal credentials, shared by every handler. Behind a mutex rather than
+// read fresh from NVS per request: NVS reads are flash reads, but a password
+// set through the portal should still take effect immediately rather than at
+// the next reboot.
+#[cfg(target_os = "espidf")]
+type AuthSlot = Arc<Mutex<AuthPolicy>>;
 
 // --------------------------------------------------------
 // ESP32 ENTRY POINT
@@ -136,6 +152,19 @@ fn main() {
         }
     };
 
+    // What this image has to do to earn its place, if it arrived over the air.
+    // Read here rather than further down so that the bail-outs between this
+    // point and the wifi connect are covered by the deadline below; anything
+    // that fails before NVS is available cannot be judged at all, and stays
+    // provisional so the bootloader reverts it at the next reboot.
+    let ota_expect = read_ota_expectation(&nvs_partition);
+    println!(
+        "> ota: running from {} ({:?} to prove)",
+        running_slot_label(),
+        ota_expect
+    );
+    arm_health_deadline(ota_expect, nvs_partition.clone());
+
     let sysloop = match EspSystemEventLoop::take() {
         Ok(s) => s,
         Err(e) => {
@@ -164,7 +193,12 @@ fn main() {
                         if let Ok(nvs) = EspNvs::new(nvs_part_clone.clone(), "wifi_cfg", true) {
                             let _ = nvs.set_u8("wap_mode", 1);
                         }
-                        println!("> reboot into wireless setup");
+                        // Holding the button is the documented way back in for
+                        // someone who has lost the portal password. Whoever can
+                        // reach the button can already rewrite the wifi config,
+                        // so this concedes nothing that was being protected.
+                        clear_auth(&nvs_part_clone);
+                        println!("> reboot into wireless setup (portal password cleared)");
                         unsafe {
                             esp_idf_svc::sys::esp_restart();
                         }
@@ -301,24 +335,46 @@ fn main() {
                 }
             }
 
+            // Three 10-second attempts rather than one. A single transient
+            // auth timeout used to strand the light in setup mode until
+            // somebody power-cycled it, and now that a failure to connect can
+            // also mean rolling firmware back, one attempt is not enough
+            // evidence to act on.
             let mut connected = false;
             if started {
-                for _ in 0..100 {
-                    // 10 second timeout
-                    if wifi.is_connected().unwrap_or(false) {
-                        connected = true;
-                        break;
+                'attempts: for attempt in 1..=WIFI_CONNECT_ATTEMPTS {
+                    for _ in 0..100 {
+                        if wifi.is_connected().unwrap_or(false) {
+                            connected = true;
+                            break 'attempts;
+                        }
+                        FreeRtos::delay_ms(100);
                     }
-                    FreeRtos::delay_ms(100);
+                    if attempt < WIFI_CONNECT_ATTEMPTS {
+                        println!(
+                            "> wifi attempt {}/{} timed out; retrying",
+                            attempt, WIFI_CONNECT_ATTEMPTS
+                        );
+                        let _ = wifi.connect();
+                    }
                 }
             }
 
             if !connected {
                 // Boot-time safety net: a bad/unreachable saved network drops
                 // us straight into the captive portal rather than stranding.
+                // If this image was pushed over the network, though, failing to
+                // get back on it is exactly the failure worth reverting -- and
+                // this fallback is what would otherwise hide it.
                 println!("> failed to connect; re-entering ap mode");
+                settle_health(ota_expect, BootOutcome::ApFallback, &nvs_partition);
                 display.set_status_color(RGB8::new(50, 0, 0));
-                run_ap_mode(&mut wifi, nvs_partition.clone(), display.clone());
+                run_ap_mode(
+                    &mut wifi,
+                    nvs_partition.clone(),
+                    display.clone(),
+                    OtaExpect::Nothing,
+                );
             } else {
                 println!("> connected successfully");
                 display.set_status_color(RGB8::new(0, 50, 0));
@@ -349,12 +405,33 @@ fn main() {
                         ip
                     );
                 }
+                // Being on the network is not enough on its own: an image that
+                // cannot serve the portal is one nobody could replace over the
+                // air, which is the thing rollback exists to avoid.
+                settle_health(
+                    ota_expect,
+                    if portal.is_some() {
+                        BootOutcome::Station
+                    } else {
+                        BootOutcome::StationNoPortal
+                    },
+                    &nvs_partition,
+                );
             }
         }
         _ => {
             println!("> activating access point");
             display.set_status_color(RGB8::new(0, 0, 50));
-            run_ap_mode(&mut wifi, nvs_partition.clone(), display.clone());
+            // Setup mode entered on purpose, either because someone held BOOT
+            // or because there are no credentials to try. Either way it is a
+            // decision, not the image failing, so an image that expected the
+            // network still counts as healthy here.
+            run_ap_mode(
+                &mut wifi,
+                nvs_partition.clone(),
+                display.clone(),
+                ota_expect,
+            );
         }
     }
 
@@ -828,7 +905,12 @@ fn normalize_char(mut c: u8) -> u8 {
 }
 
 #[cfg(target_os = "espidf")]
-fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition, display: DisplayDriver) {
+fn run_ap_mode(
+    wifi: &mut EspWifi,
+    nvs_partition: EspDefaultNvsPartition,
+    display: DisplayDriver,
+    ota_expect: OtaExpect,
+) {
     println!("> scanning for wifi networks...");
 
     // temporarily switch to client mode to scan
@@ -852,14 +934,20 @@ fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition, displa
     let _server = match start_portal(
         PortalMode::Setup,
         ssids,
-        nvs_partition,
+        nvs_partition.clone(),
         display.clone(),
         Some(pending.clone()),
     ) {
-        Some(s) => s,
+        Some(s) => {
+            // Setup mode is up and serving, which is all an image delivered
+            // through the access point ever promised to do.
+            settle_health(ota_expect, BootOutcome::ApRequested, &nvs_partition);
+            s
+        }
         None => {
             // without the portal there is no way to finish setup
             println!("> fatal: setup portal unavailable");
+            settle_health(ota_expect, BootOutcome::ApNoPortal, &nvs_partition);
             loop {
                 FreeRtos::delay_ms(1000);
             }
@@ -878,10 +966,13 @@ fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition, displa
     let mut last_marquee_update = Instant::now();
 
     loop {
-        // advance the live preview marquee
-        let (off, last) = marquee_tick(&display, marquee_offset, last_marquee_update);
-        marquee_offset = off;
-        last_marquee_update = last;
+        // advance the live preview marquee, unless firmware is being written,
+        // in which case the panels are showing the progress bar instead
+        if display.update_progress().is_none() {
+            let (off, last) = marquee_tick(&display, marquee_offset, last_marquee_update);
+            marquee_offset = off;
+            last_marquee_update = last;
+        }
 
         // handle any queued wifi test
         let job = match pending.lock() {
@@ -927,7 +1018,13 @@ fn start_portal(
     display: DisplayDriver,
     wifi_test: Option<WifiTestSlot>,
 ) -> Option<EspHttpServer<'static>> {
-    let server_config = HttpConfiguration::default();
+    let server_config = HttpConfiguration {
+        // The OTA handler decodes a header, holds a 4K chunk buffer and calls
+        // down into the flash driver. esp-idf-svc's default of 6K is not much
+        // room for that; the cost of the extra few kilobytes is one task.
+        stack_size: 10240,
+        ..Default::default()
+    };
     let mut server = match EspHttpServer::new(&server_config) {
         Ok(s) => s,
         Err(e) => {
@@ -936,6 +1033,12 @@ fn start_portal(
         }
     };
     let mode = Arc::new(mode);
+    // Read once per portal rather than per request: NVS reads are flash reads,
+    // and a credential change reboots anyway.
+    let auth: AuthSlot = Arc::new(Mutex::new(load_auth_policy(&nvs_partition)));
+    if !auth.lock().map(|a| a.is_configured()).unwrap_or(false) {
+        println!("> warning: no portal password set; anyone on this network can reconfigure or reflash this light");
+    }
 
     // ---- GET / : the setup page ----
     {
@@ -943,9 +1046,22 @@ fn start_portal(
         let ssids = ssids.clone();
         let nvs_partition = nvs_partition.clone();
         let mode = mode.clone();
-        let _ = server.fn_handler("/", Method::Get, move |req| {
+        let page_auth = auth.clone();
+        guarded(&mut server, "/", Method::Get, auth.clone(), move |req| {
             let port = read_listen_port(&nvs_partition);
-            let html = render_portal(&ssids, &display, port, &mode);
+            let html = match page_auth.lock() {
+                Ok(policy) => {
+                    let firmware = RunningFirmware {
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        slot: running_slot_label(),
+                    };
+                    render_portal(&ssids, &display, port, &mode, &policy, &firmware)
+                }
+                // Unreachable in practice: the guard this handler sits behind
+                // has already refused a poisoned lock. Serve something anyway
+                // rather than panic inside an http handler.
+                Err(_) => "<html><body>portal state unavailable</body></html>".to_string(),
+            };
             let mut res = req.into_ok_response()?;
             res.write_all(html.as_bytes())?;
             Ok::<(), EspIOError>(())
@@ -958,174 +1074,436 @@ fn start_portal(
         let nvs_partition = nvs_partition.clone();
         let display = display.clone();
         let wifi_test = wifi_test.clone();
-        let _ = server.fn_handler("/save", Method::Post, move |mut req| {
-            let body = read_body(&mut req);
-            let fields = parse_form(&body);
+        let save_auth = auth.clone();
+        guarded(
+            &mut server,
+            "/save",
+            Method::Post,
+            auth.clone(),
+            move |mut req| {
+                let body = read_body(&mut req);
+                let fields = parse_form(&body);
 
-            // --- marquee + port config (disp_cfg namespace) ---
-            if let Ok(mut cfg) = EspNvs::new(nvs_partition.clone(), "disp_cfg", true) {
-                if let Some(v) = fields.get("mq_text") {
-                    let v = truncate_chars(v, MARQUEE_TEXT_MAX);
-                    write_str_if_changed(&mut cfg, "mq_text", &v);
-                    display.set_marquee_text(&v);
-                }
-                if let Some(v) = fields.get("mq_speed_ms") {
-                    if let Ok(ms) = v.parse::<u16>() {
-                        let ms = clamp_speed_ms(ms);
-                        write_u16_if_changed(&mut cfg, "mq_speed_ms", ms);
-                        display.set_marquee_speed_ms(ms);
+                // --- marquee + port config (disp_cfg namespace) ---
+                if let Ok(mut cfg) = EspNvs::new(nvs_partition.clone(), "disp_cfg", true) {
+                    if let Some(v) = fields.get("mq_text") {
+                        let v = truncate_chars(v, MARQUEE_TEXT_MAX);
+                        write_str_if_changed(&mut cfg, "mq_text", &v);
+                        display.set_marquee_text(&v);
                     }
-                }
-                if let Some(v) = fields.get("mq_orient") {
-                    if let Ok(o) = v.parse::<u8>() {
-                        let o = match o {
-                            ORIENT_0 | ORIENT_90 | ORIENT_180 | ORIENT_270 => o,
-                            _ => ORIENT_0,
-                        };
-                        write_u8_if_changed(&mut cfg, "mq_orient", o);
-                        display.set_orientation(o);
+                    if let Some(v) = fields.get("mq_speed_ms") {
+                        if let Ok(ms) = v.parse::<u16>() {
+                            let ms = clamp_speed_ms(ms);
+                            write_u16_if_changed(&mut cfg, "mq_speed_ms", ms);
+                            display.set_marquee_speed_ms(ms);
+                        }
                     }
-                }
-                if let Some(v) = fields.get("mq_dir") {
-                    if let Ok(d) = v.parse::<u8>() {
-                        // clamp against whatever orientation we just stored
-                        let cur_orient = display.marquee_config().orientation;
-                        let d = clamp_direction(cur_orient, d);
-                        write_u8_if_changed(&mut cfg, "mq_dir", d);
-                        display.set_direction(d);
+                    if let Some(v) = fields.get("mq_orient") {
+                        if let Ok(o) = v.parse::<u8>() {
+                            let o = match o {
+                                ORIENT_0 | ORIENT_90 | ORIENT_180 | ORIENT_270 => o,
+                                _ => ORIENT_0,
+                            };
+                            write_u8_if_changed(&mut cfg, "mq_orient", o);
+                            display.set_orientation(o);
+                        }
                     }
-                }
-                if let Some(v) = fields.get("panel_margin") {
-                    if let Ok(m) = v.parse::<u8>() {
-                        let m = m.min(PANEL_MARGIN_MAX);
-                        write_u8_if_changed(&mut cfg, "panel_margin", m);
-                        display.set_panel_margin(m);
+                    if let Some(v) = fields.get("mq_dir") {
+                        if let Ok(d) = v.parse::<u8>() {
+                            // clamp against whatever orientation we just stored
+                            let cur_orient = display.marquee_config().orientation;
+                            let d = clamp_direction(cur_orient, d);
+                            write_u8_if_changed(&mut cfg, "mq_dir", d);
+                            display.set_direction(d);
+                        }
                     }
-                }
-                // checkbox state sent explicitly as 0/1 by the page
-                if let Some(v) = fields.get("margin_streams") {
-                    let on = v == "1";
-                    write_u8_if_changed(&mut cfg, "margin_strm", on as u8);
-                    display.set_margin_applies_streams(on);
-                }
-                if let Some(v) = fields.get("listen_port") {
-                    if let Ok(p) = v.parse::<u16>() {
-                        if p != 0 {
-                            write_u16_if_changed(&mut cfg, "listen_port", p);
+                    if let Some(v) = fields.get("panel_margin") {
+                        if let Ok(m) = v.parse::<u8>() {
+                            let m = m.min(PANEL_MARGIN_MAX);
+                            write_u8_if_changed(&mut cfg, "panel_margin", m);
+                            display.set_panel_margin(m);
+                        }
+                    }
+                    // checkbox state sent explicitly as 0/1 by the page
+                    if let Some(v) = fields.get("margin_streams") {
+                        let on = v == "1";
+                        write_u8_if_changed(&mut cfg, "margin_strm", on as u8);
+                        display.set_margin_applies_streams(on);
+                    }
+                    if let Some(v) = fields.get("listen_port") {
+                        if let Ok(p) = v.parse::<u16>() {
+                            if p != 0 {
+                                write_u16_if_changed(&mut cfg, "listen_port", p);
+                            }
                         }
                     }
                 }
-            }
 
-            // --- wifi credentials (wifi_cfg namespace) ---
-            // ONLY touched when a non-empty SSID is supplied. A blank SSID means
-            // "keep the current network unchanged", so we never clobber stored
-            // credentials on a marquee-only save.
-            let mut queued_test = false;
-            if let Some(ssid) = fields.get("ssid") {
-                let ssid = ssid.trim();
-                if !ssid.is_empty() {
-                    let pass = fields.get("password").cloned().unwrap_or_default();
-                    if let Ok(mut wc) = EspNvs::new(nvs_partition.clone(), "wifi_cfg", true) {
-                        write_str_if_changed(&mut wc, "ssid", ssid);
-                        write_str_if_changed(&mut wc, "pass", &pass);
-                        // ensure the next boot attempts client mode
-                        write_u8_if_changed(&mut wc, "wap_mode", 0);
-                    }
-                    // In setup mode, queue a test-in-place for the AP loop to
-                    // run. On a live network there is no slot: the credentials
-                    // are simply stored and tried at the reboot that follows.
-                    if let Some(pending) = &wifi_test {
-                        if let Ok(mut slot) = pending.lock() {
-                            *slot = Some((ssid.to_string(), pass));
-                            queued_test = true;
+                // --- wifi credentials (wifi_cfg namespace) ---
+                // ONLY touched when a non-empty SSID is supplied. A blank SSID means
+                // "keep the current network unchanged", so we never clobber stored
+                // credentials on a marquee-only save.
+                let mut queued_test = false;
+                if let Some(ssid) = fields.get("ssid") {
+                    let ssid = ssid.trim();
+                    if !ssid.is_empty() {
+                        let pass = fields.get("password").cloned().unwrap_or_default();
+                        if let Ok(mut wc) = EspNvs::new(nvs_partition.clone(), "wifi_cfg", true) {
+                            write_str_if_changed(&mut wc, "ssid", ssid);
+                            write_str_if_changed(&mut wc, "pass", &pass);
+                            // ensure the next boot attempts client mode
+                            write_u8_if_changed(&mut wc, "wap_mode", 0);
+                        }
+                        // In setup mode, queue a test-in-place for the AP loop to
+                        // run. On a live network there is no slot: the credentials
+                        // are simply stored and tried at the reboot that follows.
+                        if let Some(pending) = &wifi_test {
+                            if let Ok(mut slot) = pending.lock() {
+                                *slot = Some((ssid.to_string(), pass));
+                                queued_test = true;
+                            }
                         }
                     }
                 }
-            }
 
-            if queued_test {
-                display.set_wifi_test(WifiTestResult::Testing);
-            }
+                // --- portal password (sec_cfg namespace) ---
+                // Same "blank means leave it alone" convention as the wifi password
+                // above, so the page never has to echo the stored secret back. The
+                // new credentials take effect on the next portal start, i.e. after
+                // the reboot the page performs.
+                if fields
+                    .get("portal_clear")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    clear_auth(&nvs_partition);
+                    if let Ok(mut policy) = save_auth.lock() {
+                        policy.user = AUTH_USER_DEFAULT.to_string();
+                        policy.pass = String::new();
+                    }
+                } else if let Some(new_pass) = fields.get("portal_pass") {
+                    if !new_pass.is_empty() {
+                        let user = fields
+                            .get("portal_user")
+                            .map(|u| u.trim())
+                            .filter(|u| !u.is_empty())
+                            .unwrap_or(AUTH_USER_DEFAULT)
+                            .to_string();
+                        if let Ok(mut sec) =
+                            EspNvs::new(nvs_partition.clone(), AUTH_NAMESPACE, true)
+                        {
+                            write_str_if_changed(&mut sec, "user", &user);
+                            write_str_if_changed(&mut sec, "pass", new_pass);
+                        }
+                        // Apply it to the running portal too, so the next request
+                        // is already challenged rather than waiting for a reboot.
+                        if let Ok(mut policy) = save_auth.lock() {
+                            policy.user = user;
+                            policy.pass = new_pass.clone();
+                        }
+                    }
+                }
 
-            let mut res = req.into_ok_response()?;
-            res.write_all(if queued_test {
-                b"saved-testing"
-            } else {
-                b"saved"
-            })?;
-            Ok::<(), EspIOError>(())
-        });
+                if queued_test {
+                    display.set_wifi_test(WifiTestResult::Testing);
+                }
+
+                let mut res = req.into_ok_response()?;
+                res.write_all(if queued_test {
+                    b"saved-testing"
+                } else {
+                    b"saved"
+                })?;
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     // ---- POST /preview : push marquee config to RAM only (no NVS) ----
     {
         let display = display.clone();
-        let _ = server.fn_handler("/preview", Method::Post, move |mut req| {
-            let body = read_body(&mut req);
-            let fields = parse_form(&body);
-            if let Some(v) = fields.get("mq_text") {
-                display.set_marquee_text(v);
-            }
-            if let Some(v) = fields.get("mq_speed_ms") {
-                if let Ok(ms) = v.parse::<u16>() {
-                    display.set_marquee_speed_ms(ms);
+        guarded(
+            &mut server,
+            "/preview",
+            Method::Post,
+            auth.clone(),
+            move |mut req| {
+                let body = read_body(&mut req);
+                let fields = parse_form(&body);
+                if let Some(v) = fields.get("mq_text") {
+                    display.set_marquee_text(v);
                 }
-            }
-            if let Some(v) = fields.get("mq_orient") {
-                if let Ok(o) = v.parse::<u8>() {
-                    display.set_orientation(o);
+                if let Some(v) = fields.get("mq_speed_ms") {
+                    if let Ok(ms) = v.parse::<u16>() {
+                        display.set_marquee_speed_ms(ms);
+                    }
                 }
-            }
-            if let Some(v) = fields.get("mq_dir") {
-                if let Ok(d) = v.parse::<u8>() {
-                    display.set_direction(d);
+                if let Some(v) = fields.get("mq_orient") {
+                    if let Ok(o) = v.parse::<u8>() {
+                        display.set_orientation(o);
+                    }
                 }
-            }
-            if let Some(v) = fields.get("panel_margin") {
-                if let Ok(m) = v.parse::<u8>() {
-                    display.set_panel_margin(m);
+                if let Some(v) = fields.get("mq_dir") {
+                    if let Ok(d) = v.parse::<u8>() {
+                        display.set_direction(d);
+                    }
                 }
-            }
-            // preview always sends the checkbox state explicitly as 0/1
-            if let Some(v) = fields.get("margin_streams") {
-                display.set_margin_applies_streams(v == "1");
-            }
-            let mut res = req.into_ok_response()?;
-            res.write_all(b"ok")?;
-            Ok::<(), EspIOError>(())
-        });
+                if let Some(v) = fields.get("panel_margin") {
+                    if let Ok(m) = v.parse::<u8>() {
+                        display.set_panel_margin(m);
+                    }
+                }
+                // preview always sends the checkbox state explicitly as 0/1
+                if let Some(v) = fields.get("margin_streams") {
+                    display.set_margin_applies_streams(v == "1");
+                }
+                let mut res = req.into_ok_response()?;
+                res.write_all(b"ok")?;
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     // ---- GET /status : current wifi test result as plain text for polling ----
     {
         let display = display.clone();
-        let _ = server.fn_handler("/status", Method::Get, move |req| {
-            let s = match display.wifi_test() {
-                WifiTestResult::Idle => "idle",
-                WifiTestResult::Testing => "testing",
-                WifiTestResult::Success => "success",
-                WifiTestResult::Failed => "failed",
-            };
-            let mut res = req.into_ok_response()?;
-            res.write_all(s.as_bytes())?;
-            Ok::<(), EspIOError>(())
-        });
+        guarded(
+            &mut server,
+            "/status",
+            Method::Get,
+            auth.clone(),
+            move |req| {
+                let s = match display.wifi_test() {
+                    WifiTestResult::Idle => "idle",
+                    WifiTestResult::Testing => "testing",
+                    WifiTestResult::Success => "success",
+                    WifiTestResult::Failed => "failed",
+                };
+                let mut res = req.into_ok_response()?;
+                res.write_all(s.as_bytes())?;
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     // ---- POST /reboot : explicit, user-initiated reboot ----
     {
-        let _ = server.fn_handler("/reboot", Method::Post, move |req| {
-            let mut res = req.into_ok_response()?;
-            res.write_all(b"rebooting")?;
-            std::thread::spawn(|| {
-                FreeRtos::delay_ms(1500);
-                unsafe {
-                    esp_idf_svc::sys::esp_restart();
+        guarded(
+            &mut server,
+            "/reboot",
+            Method::Post,
+            auth.clone(),
+            move |req| {
+                let mut res = req.into_ok_response()?;
+                res.write_all(b"rebooting")?;
+                std::thread::spawn(|| {
+                    FreeRtos::delay_ms(1500);
+                    unsafe {
+                        esp_idf_svc::sys::esp_restart();
+                    }
+                });
+                Ok::<(), EspIOError>(())
+            },
+        );
+    }
+
+    // ---- GET /version : what is running, for the push script to check ----
+    // Deliberately a new endpoint rather than an extension of /status, whose
+    // bare-word body the portal's own javascript string-compares.
+    {
+        guarded(
+            &mut server,
+            "/version",
+            Method::Get,
+            auth.clone(),
+            move |req| {
+                let uptime_ms = unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1000;
+                let state = EspOta::new()
+                    .and_then(|ota| ota.get_running_slot())
+                    .map(|slot| format!("{:?}", slot.state).to_lowercase())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let body = format!(
+                    concat!(
+                        "{{\"name\":\"{}\",\"version\":\"{}\",\"idf\":\"{}\",",
+                        "\"partition\":\"{}\",\"elf_sha256\":\"{}\",",
+                        "\"ota_state\":\"{}\",\"uptime_ms\":{}}}"
+                    ),
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION"),
+                    running_idf_version(),
+                    running_slot_label(),
+                    running_elf_sha256(),
+                    state,
+                    uptime_ms,
+                );
+                let mut res =
+                    req.into_response(200, None, &[("Content-Type", "application/json")])?;
+                res.write_all(body.as_bytes())?;
+                Ok::<(), EspIOError>(())
+            },
+        );
+    }
+
+    // ---- POST /ota : a raw application image, straight into the spare slot ----
+    // The body is the bare .bin, so one endpoint serves both
+    // `curl --data-binary @app.bin` and a browser sending a File through XHR,
+    // and nothing here has to parse multipart.
+    {
+        let display = display.clone();
+        let nvs_partition = nvs_partition.clone();
+        let mode = mode.clone();
+        let ota_auth = auth.clone();
+        guarded(
+            &mut server,
+            "/ota",
+            Method::Post,
+            auth.clone(),
+            move |mut req| {
+                use std::sync::atomic::Ordering;
+
+                // An open portal will serve the settings page, but it will not
+                // run arbitrary code. This is the one place where "no password
+                // set" is refused rather than tolerated.
+                let configured = ota_auth
+                    .lock()
+                    .map(|policy| policy.is_configured())
+                    .unwrap_or(false);
+                if !configured {
+                    return plain_response(
+                        req,
+                        403,
+                        "set a portal password before uploading firmware",
+                    );
                 }
-            });
-            Ok::<(), EspIOError>(())
-        });
+
+                if OTA_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+                    return plain_response(req, 409, "another update is already running");
+                }
+                let _in_flight = OtaInFlight;
+
+                let slot = ota_slot_size();
+                let total = match check_upload_size(req.content_len(), slot) {
+                    Ok(n) => n,
+                    Err(problem) => {
+                        return plain_response(req, problem.status(), &problem.message())
+                    }
+                };
+
+                let mut ota = match EspOta::new() {
+                    Ok(ota) => ota,
+                    Err(e) => {
+                        println!("> ota: cannot reach the ota slots: {:?}", e);
+                        return plain_response(req, 500, "no ota slots on this device");
+                    }
+                };
+
+                // Someone authenticated and reached this endpoint, which is
+                // proof that the running image works well enough to be talked
+                // to. Confirm it, or esp_ota_begin refuses while the image is
+                // still provisional and the only way out would be a cable.
+                if let Ok(running) = ota.get_running_slot() {
+                    if running.state == SlotState::Unverified {
+                        println!("> ota: confirming the running image so it can be replaced");
+                        let _ = ota.mark_running_slot_valid();
+                        HEALTH_SETTLED.store(true, Ordering::SeqCst);
+                        clear_ota_expectation(&nvs_partition);
+                    }
+                }
+
+                let mut update = match ota.initiate_update() {
+                    Ok(update) => update,
+                    Err(e) => {
+                        println!("> ota: could not open the spare slot: {:?}", e);
+                        return plain_response(req, 500, "could not open the spare slot");
+                    }
+                };
+
+                if let Some(who) = req.header("X-OTA-Pusher") {
+                    println!("> ota: {} bytes incoming from {}", total, who);
+                } else {
+                    println!("> ota: {} bytes incoming", total);
+                }
+
+                display.begin_update();
+                let mut buf = vec![0u8; OTA_CHUNK];
+                let mut head: Vec<u8> = Vec::with_capacity(OTA_HEADER_PEEK);
+                let mut written = 0usize;
+                let mut last_percent = u8::MAX;
+                let mut failure: Option<(u16, String)> = None;
+
+                while written < total {
+                    let want = OTA_CHUNK.min(total - written);
+                    let n = match req.read(&mut buf[..want]) {
+                        Ok(0) => {
+                            failure = Some((400, "the body ended early".to_string()));
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(e) => {
+                            failure = Some((408, format!("upload stalled: {:?}", e)));
+                            break;
+                        }
+                    };
+                    if head.len() < OTA_HEADER_PEEK {
+                        let take = n.min(OTA_HEADER_PEEK - head.len());
+                        head.extend_from_slice(&buf[..take]);
+                        if let Err(problem) = validate_image_prefix(&head) {
+                            failure = Some((400, problem.message().to_string()));
+                            break;
+                        }
+                    }
+                    if let Err(e) = update.write(&buf[..n]) {
+                        failure = Some((500, format!("flash write failed: {:?}", e)));
+                        break;
+                    }
+                    written += n;
+                    let percent = ota_progress_percent(written, total);
+                    if percent != last_percent {
+                        display.set_update_progress(percent);
+                        last_percent = percent;
+                    }
+                }
+
+                if let Some((status, why)) = failure {
+                    let _ = update.abort();
+                    display.end_update();
+                    println!("> ota: gave up after {}/{} bytes: {}", written, total, why);
+                    return plain_response(req, status, &why);
+                }
+
+                // Record what this image has to prove before the boot pointer
+                // moves, so a power cut between the two cannot lose it.
+                let expect = match mode.as_ref() {
+                    PortalMode::Connected { .. } => OtaExpect::Station,
+                    PortalMode::Setup => OtaExpect::Ap,
+                };
+                write_ota_expectation(&nvs_partition, expect);
+
+                if let Err(e) = update.complete() {
+                    clear_ota_expectation(&nvs_partition);
+                    display.end_update();
+                    println!("> ota: esp-idf rejected the image: {:?}", e);
+                    return plain_response(req, 400, "the image failed esp-idf's own checks");
+                }
+
+                display.set_update_progress(100);
+                println!(
+                    "> ota: written, rebooting into it (must reach {:?})",
+                    expect
+                );
+
+                // Answer before rebooting, the same way POST /reboot does, or
+                // every successful push looks like a dropped connection.
+                plain_response(req, 200, "ok")?;
+                std::thread::spawn(|| {
+                    FreeRtos::delay_ms(1500);
+                    unsafe {
+                        esp_idf_svc::sys::esp_restart();
+                    }
+                });
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     Some(server)
@@ -1195,8 +1573,624 @@ fn test_credentials(wifi: &mut EspWifi, ssid: &str, pass: &str) -> bool {
 }
 
 // --------------------------------------------------------
+// PORTAL AUTHENTICATION
+// --------------------------------------------------------
+// The portal can change the wifi credentials, reboot the light and (since the
+// OTA work) replace its firmware, so it sits behind HTTP Basic auth. The parts
+// that decide whether a request is allowed are pure functions, compiled on the
+// host too, because they are the parts worth testing.
+
+// Where the portal credentials live. Its own namespace rather than wifi_cfg or
+// disp_cfg so that clearing either of those cannot lock anyone out.
+#[cfg(target_os = "espidf")]
+const AUTH_NAMESPACE: &str = "sec_cfg";
+
+// Used when nobody has set a username. The password has no default: an unset
+// password means the portal is open (see AuthPolicy::is_configured).
+#[cfg(any(target_os = "espidf", test))]
+const AUTH_USER_DEFAULT: &str = "admin";
+
+// What the portal page says about the image it is being served by. Passed in
+// rather than read inside the renderer, so the renderer stays pure and testable.
+#[cfg(any(target_os = "espidf", test))]
+pub struct RunningFirmware {
+    pub version: String,
+    pub slot: String,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+pub struct AuthPolicy {
+    pub user: String,
+    pub pass: String,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl AuthPolicy {
+    // No stored password means nobody has set one yet, and the portal serves
+    // everyone. That keeps a firmware update from locking an existing light out
+    // of its own portal; the page nags about it instead, and the firmware
+    // upload endpoint refuses to run until a password exists.
+    pub fn is_configured(&self) -> bool {
+        !self.pass.is_empty()
+    }
+}
+
+// Decode standard base64 (RFC 4648, no line breaks, optional '=' padding).
+//
+// Hand-rolled because the generated esp-idf bindings do not expose mbedtls's
+// base64 -- and because a pure decoder can be tested on the host, which an FFI
+// call could not be. Output is capped: the only thing being decoded here is a
+// "user:password" pair, and an attacker should not be able to make the portal
+// allocate by sending a long header.
+#[cfg(any(target_os = "espidf", test))]
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const MAX_OUT: usize = 192;
+
+    fn sextet(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((b - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut i = 0;
+    while i < bytes.len() {
+        let chunk = &bytes[i..i + 4];
+        let is_last = i + 4 == bytes.len();
+        let mut acc: u32 = 0;
+        let mut pad = 0usize;
+        for (j, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                // Padding is legal only in the last two slots of the last chunk.
+                if !is_last || j < 2 {
+                    return None;
+                }
+                pad += 1;
+                acc <<= 6;
+            } else {
+                // ...and nothing may follow it.
+                if pad > 0 {
+                    return None;
+                }
+                acc = (acc << 6) | sextet(b)?;
+            }
+        }
+        for k in 0..(3 - pad) {
+            out.push(((acc >> (16 - 8 * k)) & 0xff) as u8);
+        }
+        if out.len() > MAX_OUT {
+            return None;
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+// Split an `Authorization: Basic <base64>` header into its user and password.
+// The scheme token is case-insensitive per RFC 7235, and only the first colon
+// separates the two, so a password may itself contain colons.
+#[cfg(any(target_os = "espidf", test))]
+fn parse_basic_auth(header: &str) -> Option<(String, String)> {
+    let (scheme, rest) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let text = String::from_utf8(base64_decode(rest.trim())?).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+// Compare without letting the time taken depend on how much of the secret
+// matched. The lengths are already observable from the wire, so only the
+// content has to be hidden; black_box keeps the optimiser from unrolling the
+// accumulation back into an early exit.
+#[cfg(any(target_os = "espidf", test))]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u32;
+    for i in 0..a.len().min(b.len()) {
+        diff |= (a[i] ^ b[i]) as u32;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+// The whole access decision, in one testable place.
+#[cfg(any(target_os = "espidf", test))]
+fn auth_ok(header: Option<&str>, policy: &AuthPolicy) -> bool {
+    if !policy.is_configured() {
+        return true;
+    }
+    let Some(header) = header else {
+        return false;
+    };
+    let Some((user, pass)) = parse_basic_auth(header) else {
+        return false;
+    };
+    // Check both halves unconditionally so a wrong username does not answer
+    // faster than a wrong password.
+    let user_ok = ct_eq(user.as_bytes(), policy.user.as_bytes());
+    let pass_ok = ct_eq(pass.as_bytes(), policy.pass.as_bytes());
+    user_ok & pass_ok
+}
+
+#[cfg(target_os = "espidf")]
+fn load_auth_policy(nvs_partition: &EspDefaultNvsPartition) -> AuthPolicy {
+    let mut user = AUTH_USER_DEFAULT.to_string();
+    let mut pass = String::new();
+    if let Ok(nvs) = EspNvs::new(nvs_partition.clone(), AUTH_NAMESPACE, true) {
+        let mut user_buf = [0u8; 96];
+        let mut pass_buf = [0u8; 160];
+        if let Ok(Some(stored)) = nvs.get_str("user", &mut user_buf) {
+            if !stored.is_empty() {
+                user = stored.to_string();
+            }
+        }
+        if let Ok(Some(stored)) = nvs.get_str("pass", &mut pass_buf) {
+            pass = stored.to_string();
+        }
+    }
+    AuthPolicy { user, pass }
+}
+
+// Forget the portal credentials. Reached by holding BOOT, which is the way back
+// in for someone who has lost the password: physical access to the button
+// already implies control of the device.
+#[cfg(target_os = "espidf")]
+fn clear_auth(nvs_partition: &EspDefaultNvsPartition) {
+    if let Ok(mut nvs) = EspNvs::new(nvs_partition.clone(), AUTH_NAMESPACE, true) {
+        let _ = nvs.remove("user");
+        let _ = nvs.remove("pass");
+    }
+}
+
+// Register a handler behind the auth check, so no individual handler carries a
+// copy of it and none can be added without one.
+#[cfg(target_os = "espidf")]
+fn guarded<F>(
+    server: &mut EspHttpServer<'static>,
+    uri: &str,
+    method: Method,
+    policy: AuthSlot,
+    handler: F,
+) where
+    F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), EspIOError> + Send + 'static,
+{
+    let _ = server.fn_handler(uri, method, move |req| {
+        let allowed = match policy.lock() {
+            Ok(policy) => auth_ok(req.header("Authorization"), &policy),
+            // A poisoned lock means a handler panicked while holding it. Refuse
+            // rather than guess which way to fail.
+            Err(_) => false,
+        };
+        if !allowed {
+            let mut res = req.into_response(
+                401,
+                Some("Unauthorized"),
+                &[
+                    ("WWW-Authenticate", "Basic realm=\"traffic light\""),
+                    ("Content-Type", "text/plain"),
+                ],
+            )?;
+            res.write_all(b"unauthorized\n")?;
+            return Ok::<(), EspIOError>(());
+        }
+        handler(req)
+    });
+}
+
+// --------------------------------------------------------
+// FIRMWARE UPDATES
+// --------------------------------------------------------
+// The device accepts a raw esp-idf application image as the body of a POST and
+// writes it into the spare app slot. The decisions -- is this plausibly our
+// firmware, is it going to fit, did the image that just booted actually work --
+// are pure functions so they can be tested off the device, which matters
+// because being wrong about any of them means a walk to the light with a cable.
+
+// Streamed in 4K pieces: one flash sector, and small enough that the buffer can
+// live on the heap without mattering. It must not be a stack array -- the httpd
+// task's stack is measured in single-digit kilobytes.
+#[cfg(target_os = "espidf")]
+const OTA_CHUNK: usize = 4096;
+
+// Enough of the head of the image to cover the esp_image_header_t (24 bytes),
+// the first segment header (8) and the start of the esp_app_desc_t that follows.
+#[cfg(any(target_os = "espidf", test))]
+const OTA_HEADER_PEEK: usize = 96;
+
+// The real firmware is ~1MB. Anything this small is a wrong file, not a build.
+#[cfg(any(target_os = "espidf", test))]
+const OTA_MIN_IMAGE: u64 = 256 * 1024;
+
+// Used only if the running slot cannot be interrogated; the real value comes
+// from the partition table (see partitions.csv).
+#[cfg(any(target_os = "espidf", test))]
+const OTA_SLOT_FALLBACK: usize = 0x1F_0000;
+
+// First byte of any esp-idf application image.
+#[cfg(any(target_os = "espidf", test))]
+const ESP_IMAGE_MAGIC: u8 = 0xE9;
+
+// esp_app_desc_t.magic_word, at offset 0x20 of the image.
+#[cfg(any(target_os = "espidf", test))]
+const ESP_APP_DESC_MAGIC: u32 = 0xABCD_5432;
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageProblem {
+    BadMagic,
+    WrongChip,
+    NoAppDescriptor,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl ImageProblem {
+    fn message(self) -> &'static str {
+        match self {
+            ImageProblem::BadMagic => "not an esp32 application image (bad magic byte)",
+            ImageProblem::WrongChip => "that image was built for a different chip",
+            ImageProblem::NoAppDescriptor => {
+                "no application descriptor -- is that a bootloader or a merged image?"
+            }
+        }
+    }
+}
+
+/// Check as much of the image header as has arrived so far. Called repeatedly
+/// as the first chunks come in, so a short prefix must be treated as "not yet
+/// known to be bad" rather than as an error.
+#[cfg(any(target_os = "espidf", test))]
+fn validate_image_prefix(head: &[u8]) -> Result<(), ImageProblem> {
+    if !head.is_empty() && head[0] != ESP_IMAGE_MAGIC {
+        return Err(ImageProblem::BadMagic);
+    }
+    if head.len() >= 14 {
+        // esp_image_header_t.chip_id, u16 LE at offset 12. ESP32 is 0.
+        if u16::from_le_bytes([head[12], head[13]]) != 0 {
+            return Err(ImageProblem::WrongChip);
+        }
+    }
+    if head.len() >= 36 {
+        let magic = u32::from_le_bytes([head[32], head[33], head[34], head[35]]);
+        if magic != ESP_APP_DESC_MAGIC {
+            return Err(ImageProblem::NoAppDescriptor);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UploadProblem {
+    LengthRequired,
+    TooSmall(u64),
+    TooLarge(u64, usize),
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl UploadProblem {
+    fn status(self) -> u16 {
+        match self {
+            UploadProblem::LengthRequired => 411,
+            UploadProblem::TooSmall(_) => 400,
+            UploadProblem::TooLarge(_, _) => 413,
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            UploadProblem::LengthRequired => {
+                "a Content-Length is required; this server cannot take a chunked body".to_string()
+            }
+            UploadProblem::TooSmall(n) => {
+                format!("{} bytes is far too small to be this firmware", n)
+            }
+            UploadProblem::TooLarge(n, slot) => format!(
+                "{} bytes will not fit the {} byte slot (a padded or merged image, perhaps?)",
+                n, slot
+            ),
+        }
+    }
+}
+
+/// Decide whether a body is worth starting an update for, before any of it is
+/// read. The most likely real mistake is a padded or merged image, which is
+/// flash-sized rather than app-sized, so that one gets its own hint.
+#[cfg(any(target_os = "espidf", test))]
+fn check_upload_size(content_len: Option<u64>, slot: usize) -> Result<usize, UploadProblem> {
+    let len = content_len.ok_or(UploadProblem::LengthRequired)?;
+    if len < OTA_MIN_IMAGE {
+        return Err(UploadProblem::TooSmall(len));
+    }
+    if len > slot as u64 {
+        return Err(UploadProblem::TooLarge(len, slot));
+    }
+    Ok(len as usize)
+}
+
+#[cfg(any(target_os = "espidf", test))]
+fn ota_progress_percent(written: usize, total: usize) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    ((written as u64 * 100 / total as u64).min(100)) as u8
+}
+
+// --------------------------------------------------------
+// ROLLBACK
+// --------------------------------------------------------
+// esp-idf boots a freshly written image in a provisional state and reverts to
+// the previous one unless the new image says it is working. What counts as
+// "working" here is whatever the light was already doing when the update was
+// accepted: an update delivered over the network has to get back on the
+// network, and one delivered through the setup access point has to bring that
+// access point back.
+
+#[cfg(target_os = "espidf")]
+const OTA_NAMESPACE: &str = "ota_cfg";
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OtaExpect {
+    /// Nothing to prove -- flashed over serial, or already confirmed.
+    Nothing,
+    Station,
+    Ap,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl OtaExpect {
+    /// Anything unrecognised degrades to "nothing to prove". A value written by
+    /// some future firmware, or a half-written byte, must never be read as a
+    /// reason to roll back -- rolling back on a guess is worse than not
+    /// rolling back at all.
+    pub fn from_nvs(stored: Option<u8>) -> Self {
+        match stored {
+            Some(1) => OtaExpect::Station,
+            Some(2) => OtaExpect::Ap,
+            _ => OtaExpect::Nothing,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            OtaExpect::Nothing => 0,
+            OtaExpect::Station => 1,
+            OtaExpect::Ap => 2,
+        }
+    }
+}
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootOutcome {
+    /// Joined the stored network and the portal is serving on it.
+    Station,
+    /// Joined, but the http server would not start.
+    StationNoPortal,
+    /// In setup mode because someone held BOOT, not because anything failed.
+    ApRequested,
+    /// In setup mode because the stored network could not be reached.
+    ApFallback,
+    /// Setup mode is up but its portal would not start.
+    ApNoPortal,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HealthVerdict {
+    MarkValid,
+    RollBack,
+}
+
+/// The whole rollback decision.
+#[cfg(any(target_os = "espidf", test))]
+fn health_verdict(expect: OtaExpect, outcome: BootOutcome) -> HealthVerdict {
+    use BootOutcome::*;
+    use HealthVerdict::*;
+    match (expect, outcome) {
+        // Nothing was promised, so nothing can be broken.
+        (OtaExpect::Nothing, _) => MarkValid,
+
+        (OtaExpect::Station, Station) => MarkValid,
+        // Someone held the button; that is a person choosing setup mode, not
+        // the new image failing to reach the network.
+        (OtaExpect::Station, ApRequested) => MarkValid,
+        // This is the case the whole feature exists for. The boot-time
+        // fallback into setup mode would otherwise make an image that cannot
+        // reach the network look perfectly healthy, forever.
+        (OtaExpect::Station, ApFallback) => RollBack,
+        // On the network but unreachable: no way to replace it over the air,
+        // which is the definition of needing a rollback.
+        (OtaExpect::Station, StationNoPortal) => RollBack,
+        (OtaExpect::Station, ApNoPortal) => RollBack,
+
+        // An update delivered over the setup access point has no network to
+        // rejoin, so only a portal that will not start counts as failure.
+        (OtaExpect::Ap, ApNoPortal) => RollBack,
+        (OtaExpect::Ap, _) => MarkValid,
+    }
+}
+
+// Where the running image's promise is kept across the reboot that follows an
+// update. Written just before the boot pointer moves, read on the next boot,
+// and cleared as soon as a verdict is reached.
+#[cfg(target_os = "espidf")]
+fn read_ota_expectation(nvs_partition: &EspDefaultNvsPartition) -> OtaExpect {
+    match EspNvs::new(nvs_partition.clone(), OTA_NAMESPACE, true) {
+        Ok(nvs) => OtaExpect::from_nvs(nvs.get_u8("expect").ok().flatten()),
+        Err(_) => OtaExpect::Nothing,
+    }
+}
+
+#[cfg(target_os = "espidf")]
+fn write_ota_expectation(nvs_partition: &EspDefaultNvsPartition, expect: OtaExpect) {
+    if let Ok(nvs) = EspNvs::new(nvs_partition.clone(), OTA_NAMESPACE, true) {
+        let _ = nvs.set_u8("expect", expect.as_u8());
+    }
+}
+
+#[cfg(target_os = "espidf")]
+fn clear_ota_expectation(nvs_partition: &EspDefaultNvsPartition) {
+    if let Ok(mut nvs) = EspNvs::new(nvs_partition.clone(), OTA_NAMESPACE, true) {
+        let _ = nvs.remove("expect");
+    }
+}
+
+// Set once a verdict has been reached, so the watchdog below knows not to fire.
+#[cfg(target_os = "espidf")]
+static HEALTH_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Only one update at a time. Two interleaved writes into the same slot produce
+// something shaped like firmware that is not firmware.
+#[cfg(target_os = "espidf")]
+static OTA_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Deliver the verdict on the running image and act on it. Does not return in
+/// the rollback case -- esp-idf reboots into the previous image.
+#[cfg(target_os = "espidf")]
+fn settle_health(expect: OtaExpect, outcome: BootOutcome, nvs_partition: &EspDefaultNvsPartition) {
+    use std::sync::atomic::Ordering;
+    if HEALTH_SETTLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Clear first, in both branches. After a rollback the *previous* image
+    // boots this same code; a surviving expectation would make it roll back
+    // again the moment the network happened to be down, and the two slots
+    // would take turns rejecting each other forever.
+    clear_ota_expectation(nvs_partition);
+
+    match health_verdict(expect, outcome) {
+        HealthVerdict::MarkValid => {
+            if let Ok(mut ota) = EspOta::new() {
+                match ota.mark_running_slot_valid() {
+                    Ok(()) => println!("> ota: image confirmed ({:?} after {:?})", expect, outcome),
+                    Err(e) => println!("> ota: could not confirm image: {:?}", e),
+                }
+            }
+        }
+        HealthVerdict::RollBack => {
+            println!(
+                "> ota: this image was supposed to reach {:?} and got {:?}; rolling back",
+                expect, outcome
+            );
+            if let Ok(mut ota) = EspOta::new() {
+                // Returns only on failure, e.g. when there is no previous
+                // image to go back to.
+                let e = ota.mark_running_slot_invalid_and_reboot();
+                println!("> ota: rollback failed: {:?}; carrying on", e);
+            }
+        }
+    }
+}
+
+/// Backstop for the paths that never reach a verdict -- no peripherals, no NVS,
+/// no wifi driver -- which would otherwise sit provisionally-booted forever,
+/// neither confirmed nor rolled back.
+#[cfg(target_os = "espidf")]
+fn arm_health_deadline(expect: OtaExpect, nvs_partition: EspDefaultNvsPartition) {
+    use std::sync::atomic::Ordering;
+    if expect == OtaExpect::Nothing {
+        return;
+    }
+    let _ = std::thread::Builder::new().stack_size(4096).spawn(move || {
+        FreeRtos::delay_ms(180_000);
+        if HEALTH_SETTLED.load(Ordering::SeqCst) {
+            return;
+        }
+        println!("> ota: three minutes with no verdict; treating that as a failure");
+        settle_health(expect, BootOutcome::ApNoPortal, &nvs_partition);
+    });
+}
+
+/// Size of the slot an update would be written into.
+#[cfg(target_os = "espidf")]
+fn ota_slot_size() -> usize {
+    let part = unsafe { esp_idf_svc::sys::esp_ota_get_next_update_partition(core::ptr::null()) };
+    if part.is_null() {
+        OTA_SLOT_FALLBACK
+    } else {
+        unsafe { (*part).size as usize }
+    }
+}
+
+/// Label of the app partition currently running, for the version endpoint.
+#[cfg(target_os = "espidf")]
+fn running_slot_label() -> String {
+    let part = unsafe { esp_idf_svc::sys::esp_ota_get_running_partition() };
+    if part.is_null() {
+        return "?".to_string();
+    }
+    let label = unsafe { core::ffi::CStr::from_ptr((*part).label.as_ptr()) };
+    label.to_string_lossy().into_owned()
+}
+
+/// The esp-idf version this image was built against, from the descriptor
+/// esp-idf itself writes into the image.
+#[cfg(target_os = "espidf")]
+fn running_idf_version() -> String {
+    let desc = unsafe { esp_idf_svc::sys::esp_app_get_description() };
+    if desc.is_null() {
+        return String::new();
+    }
+    let raw = unsafe { core::ffi::CStr::from_ptr((*desc).idf_ver.as_ptr()) };
+    raw.to_string_lossy().into_owned()
+}
+
+/// The SHA-256 esp-idf stamps into the image, as hex. This is what identifies
+/// one build from another: the version string does not change while you are
+/// iterating, and the descriptor's own version field is a git-describe of
+/// esp-idf-sys's dummy cmake project rather than of this crate.
+#[cfg(target_os = "espidf")]
+fn running_elf_sha256() -> String {
+    let desc = unsafe { esp_idf_svc::sys::esp_app_get_description() };
+    if desc.is_null() {
+        return String::new();
+    }
+    let sha = unsafe { (*desc).app_elf_sha256 };
+    let mut out = String::with_capacity(64);
+    for b in sha {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+// --------------------------------------------------------
 // HTTP HELPERS (ESP32 ONLY)
 // --------------------------------------------------------
+// Plain-text reply for the endpoints a script talks to, where the status code
+// carries the meaning and the body just says why.
+#[cfg(target_os = "espidf")]
+fn plain_response(
+    req: Request<&mut EspHttpConnection<'_>>,
+    status: u16,
+    message: &str,
+) -> Result<(), EspIOError> {
+    let mut res = req.into_response(status, None, &[("Content-Type", "text/plain")])?;
+    res.write_all(message.as_bytes())?;
+    res.write_all(b"\n")?;
+    Ok(())
+}
+
+// Releases the single-flight flag however the handler leaves.
+#[cfg(target_os = "espidf")]
+struct OtaInFlight;
+
+#[cfg(target_os = "espidf")]
+impl Drop for OtaInFlight {
+    fn drop(&mut self) {
+        OTA_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(target_os = "espidf")]
 fn read_body<R>(req: &mut R) -> String
 where
@@ -1272,8 +2266,31 @@ fn render_portal(
     display: &DisplayDriver,
     listen_port: u16,
     mode: &PortalMode,
+    auth: &AuthPolicy,
+    firmware: &RunningFirmware,
 ) -> String {
     let cfg = display.marquee_config();
+    // An unconfigured portal is open to everyone who can reach it, which is
+    // worth saying loudly rather than burying in the form below.
+    let auth_note = if auth.is_configured() {
+        String::new()
+    } else {
+        "<div class=\"status failed\">No portal password is set, so anyone on this network \
+         can reconfigure this light. Firmware uploads stay disabled until you set one.</div>"
+            .to_string()
+    };
+    let auth_user = html_escape(&auth.user);
+    // Uploading firmware runs whatever is uploaded, so unlike the rest of the
+    // page it is not offered at all until there is a password to gate it.
+    let firmware_control = if auth.is_configured() {
+        "<div class=\"form-group\">\n        <input type=\"file\" id=\"fw\" accept=\".bin\" />\n      </div>\n               <div id=\"fw_status\" class=\"status idle\">Choose a .bin built by <code>cargo build --release</code>.</div>\n               <button onclick=\"uploadFirmware()\">Upload firmware</button>"
+            .to_string()
+    } else {
+        "<div class=\"status failed\">Set a portal password above before uploading firmware.</div>"
+            .to_string()
+    };
+    let fw_version = html_escape(&firmware.version);
+    let fw_slot = html_escape(&firmware.slot);
     let (mode_note, reboot_note) = match mode {
         PortalMode::Setup => (String::new(), "The setup portal will close.".to_string()),
         PortalMode::Connected { ip } => (
@@ -1412,6 +2429,61 @@ fn render_portal(
             || d.listen_port !== SAVED.listen_port;
       }}
 
+      // Firmware goes up as the raw file, not multipart: the device reads the
+      // body straight into flash, and the same endpoint then works from a
+      // shell with `curl --data-binary @app.bin`. XMLHttpRequest rather than
+      // fetch() because only XHR reports upload progress, and a megabyte over
+      // wifi is long enough that a progress bar is the difference between
+      // "working" and "hung".
+      function uploadFirmware() {{
+        var f = document.getElementById("fw").files[0];
+        var box = document.getElementById("fw_status");
+        if (!f) {{ alert("Choose a .bin first."); return; }}
+        if (!confirm("Upload " + f.name + " (" + Math.round(f.size / 1024) + " KB) and reboot into it?")) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", "/ota", true);
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        xhr.upload.onprogress = function(e) {{
+          if (!e.lengthComputable) return;
+          box.className = "status testing";
+          box.textContent = "Uploading " + Math.floor(100 * e.loaded / e.total) + "% - watch the lamps.";
+        }};
+        xhr.onload = function() {{
+          if (xhr.status === 200) {{
+            box.className = "status success";
+            box.textContent = "Written. Rebooting into it; this page will come back in a few seconds.";
+            setTimeout(function() {{ location.reload(); }}, 15000);
+          }} else {{
+            box.className = "status failed";
+            box.textContent = "Refused (" + xhr.status + "): " + xhr.responseText;
+          }}
+        }};
+        xhr.onerror = function() {{
+          box.className = "status failed";
+          box.textContent = "The connection dropped during the upload. Nothing was changed.";
+        }};
+        xhr.send(f);
+      }}
+
+      // The portal password is saved on its own rather than through the reboot
+      // path: it takes effect on the next request, so there is nothing to
+      // reboot for, and bundling a secret into the marquee payload would mean
+      // re-sending it on every unrelated save.
+      function savePortalAuth() {{
+        var pass = document.getElementById("portal_pass").value;
+        if (!pass) {{ alert("Enter a new password first."); return; }}
+        var user = document.getElementById("portal_user").value;
+        post("/save", {{ portal_user: user, portal_pass: pass }}).then(function() {{
+          alert("Password set. The browser will ask for it on the next page load.");
+          location.reload();
+        }});
+      }}
+
+      function clearPortalAuth() {{
+        if (!confirm("Remove the portal password? Anyone on this network will then be able to reconfigure and reflash this light.")) return;
+        post("/save", {{ portal_clear: "1" }}).then(function() {{ location.reload(); }});
+      }}
+
       // Single action: reboot. If the marquee settings or a wifi network changed,
       // offer to save first; otherwise just confirm the reboot.
       function doReboot() {{
@@ -1462,6 +2534,7 @@ fn render_portal(
     <div class="container">
       <h2>Traffic Light Setup</h2>
       {mode_note}
+      {auth_note}
 
       <h3>Wi-Fi</h3>
       <div id="wifi_status" class="status {status_class}">{status_text}</div>
@@ -1517,11 +2590,35 @@ fn render_portal(
         <input type="number" id="listen_port" min="1" max="65535" value="{port}" />
       </div>
 
+      <h3>Portal access</h3>
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="portal_user" value="{auth_user}" />
+      </div>
+      <div class="form-group">
+        <label>New password <span class="hint">(leave blank to keep the current one)</span></label>
+        <input type="password" id="portal_pass" />
+      </div>
+      <button onclick="savePortalAuth()">Set portal password</button>
+      <button onclick="clearPortalAuth()">Remove password</button>
+
+      <h3>Firmware</h3>
+      <div class="form-group">
+        <label>Running <span class="hint">(version, and which of the two slots it booted from)</span></label>
+        <div>{fw_version} from {fw_slot}</div>
+      </div>
+      {firmware_control}
+
       <button onclick="doReboot()">Reboot</button>
     </div>
   </body>
 </html>"#,
         mode_note = mode_note,
+        auth_note = auth_note,
+        auth_user = auth_user,
+        firmware_control = firmware_control,
+        fw_version = fw_version,
+        fw_slot = fw_slot,
         reboot_note = reboot_note,
         status_class = wifi_status_class(display),
         status_text = wifi_status_text(display),
@@ -1743,9 +2840,31 @@ const FONT: [u8; 325] = [
 mod portal_tests {
     use super::*;
 
+    fn locked() -> AuthPolicy {
+        AuthPolicy {
+            user: AUTH_USER_DEFAULT.to_string(),
+            pass: "hunter2".to_string(),
+        }
+    }
+
+    fn open() -> AuthPolicy {
+        AuthPolicy {
+            user: AUTH_USER_DEFAULT.to_string(),
+            pass: String::new(),
+        }
+    }
+
     fn page(mode: PortalMode) -> String {
+        page_with(mode, &locked())
+    }
+
+    fn page_with(mode: PortalMode, auth: &AuthPolicy) -> String {
         let display = DisplayDriver::new_simulated();
-        render_portal(&["lab".to_string()], &display, 4048, &mode)
+        let firmware = RunningFirmware {
+            version: "9.9.9".to_string(),
+            slot: "ota_1".to_string(),
+        };
+        render_portal(&["lab".to_string()], &display, 4048, &mode, auth, &firmware)
     }
 
     #[test]
@@ -1773,5 +2892,446 @@ mod portal_tests {
         });
         assert!(!p.contains("at <script>"));
         assert!(p.contains("at &lt;script&gt;"));
+    }
+
+    #[test]
+    fn the_page_shows_what_is_running_and_offers_an_upload() {
+        let p = page_with(PortalMode::Setup, &locked());
+        assert!(p.contains("9.9.9 from ota_1"));
+        assert!(p.contains("id=\"fw\""));
+        assert!(p.contains("xhr.open(\"POST\", \"/ota\", true)"));
+    }
+
+    #[test]
+    fn an_unprotected_portal_does_not_offer_firmware_upload() {
+        // The endpoint refuses in this state anyway; not drawing the control
+        // is so the page says why rather than failing when it is used.
+        let p = page_with(PortalMode::Setup, &open());
+        assert!(!p.contains("id=\"fw\""));
+        assert!(p.contains("Set a portal password above before uploading firmware"));
+    }
+
+    #[test]
+    fn a_portal_with_no_password_says_so_loudly() {
+        let p = page_with(PortalMode::Setup, &open());
+        assert!(p.contains("No portal password is set"));
+    }
+
+    #[test]
+    fn a_portal_with_a_password_does_not_nag() {
+        let p = page_with(PortalMode::Setup, &locked());
+        assert!(!p.contains("No portal password is set"));
+    }
+
+    #[test]
+    fn the_page_never_echoes_the_stored_password_back() {
+        // The password field is write-only by design: the page offers somewhere
+        // to type a new one and nothing that would leak the current one to a
+        // browser cache, a screenshot or a shoulder.
+        let p = page_with(PortalMode::Setup, &locked());
+        assert!(!p.contains("hunter2"));
+        assert!(p.contains("id=\"portal_pass\""));
+    }
+
+    #[test]
+    fn the_username_is_escaped_like_everything_else() {
+        let p = page_with(
+            PortalMode::Setup,
+            &AuthPolicy {
+                user: "a\"><script>".to_string(),
+                pass: "x".to_string(),
+            },
+        );
+        assert!(!p.contains("a\"><script>"));
+        assert!(p.contains("&lt;script&gt;"));
+    }
+}
+
+// Authentication is the part of the portal where being wrong is expensive, and
+// all of it is pure, so all of it is tested here rather than on the device.
+#[cfg(all(test, not(target_os = "espidf")))]
+mod auth_tests {
+    use super::*;
+
+    fn policy(user: &str, pass: &str) -> AuthPolicy {
+        AuthPolicy {
+            user: user.to_string(),
+            pass: pass.to_string(),
+        }
+    }
+
+    fn header(user: &str, pass: &str) -> String {
+        // Encode with an independent implementation so the test is not just
+        // base64_decode agreeing with itself.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let raw = format!("{}:{}", user, pass).into_bytes();
+        let mut out = String::from("Basic ");
+        for chunk in raw.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base64_decodes_the_rfc4648_vectors() {
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
+        assert_eq!(base64_decode("YWRtaW46c2VjcmV0").unwrap(), b"admin:secret");
+    }
+
+    #[test]
+    fn base64_rejects_what_is_not_base64() {
+        assert!(base64_decode("Zm9").is_none(), "length not a multiple of 4");
+        assert!(
+            base64_decode("Zm9!").is_none(),
+            "character outside alphabet"
+        );
+        assert!(base64_decode("Z=9v").is_none(), "padding in the middle");
+        assert!(
+            base64_decode("Zm==Zm9v").is_none(),
+            "padding before the end"
+        );
+        assert!(base64_decode("Z===").is_none(), "three padding characters");
+        // An over-long header must not make the device allocate for it.
+        assert!(base64_decode(&"QUJD".repeat(200)).is_none());
+    }
+
+    #[test]
+    fn basic_auth_splits_the_header() {
+        assert_eq!(
+            parse_basic_auth("Basic YWRtaW46c2VjcmV0"),
+            Some(("admin".to_string(), "secret".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_scheme_token_is_case_insensitive() {
+        // RFC 7235: the auth scheme is a case-insensitive token, and real
+        // clients do send "basic".
+        assert!(parse_basic_auth("basic YWRtaW46c2VjcmV0").is_some());
+        assert!(parse_basic_auth("BASIC YWRtaW46c2VjcmV0").is_some());
+        assert!(parse_basic_auth("Bearer YWRtaW46c2VjcmV0").is_none());
+    }
+
+    #[test]
+    fn a_password_may_contain_colons() {
+        assert_eq!(
+            parse_basic_auth(&header("admin", "a:b:c")),
+            Some(("admin".to_string(), "a:b:c".to_string()))
+        );
+    }
+
+    #[test]
+    fn malformed_headers_are_rejected_rather_than_guessed_at() {
+        assert!(parse_basic_auth("Basic").is_none(), "no credential at all");
+        assert!(parse_basic_auth("Basic !!!!").is_none(), "not base64");
+        assert!(
+            parse_basic_auth(&{
+                let mut h = String::from("Basic ");
+                h.push_str("bm9jb2xvbg==");
+                h
+            })
+            .is_none(),
+            "decodes, but has no colon"
+        );
+    }
+
+    #[test]
+    fn ct_eq_agrees_with_ordinary_equality() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secrer"), "differs in the last byte");
+        assert!(!ct_eq(b"secret", b"tecret"), "differs in the first byte");
+        assert!(!ct_eq(b"secret", b"secretx"), "prefix is not a match");
+        assert!(!ct_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn an_unconfigured_portal_lets_everyone_in() {
+        // Deliberate: a firmware update must not lock an existing light out of
+        // its own portal. The page nags and /ota refuses instead.
+        let p = policy("admin", "");
+        assert!(auth_ok(None, &p));
+        assert!(auth_ok(Some(&header("nobody", "nothing")), &p));
+    }
+
+    #[test]
+    fn a_configured_portal_wants_the_right_credentials() {
+        let p = policy(AUTH_USER_DEFAULT, "hunter2");
+        assert!(auth_ok(Some(&header(AUTH_USER_DEFAULT, "hunter2")), &p));
+        assert!(
+            !auth_ok(Some(&header("admin", "hunter3")), &p),
+            "wrong password"
+        );
+        assert!(!auth_ok(Some(&header("root", "hunter2")), &p), "wrong user");
+        assert!(!auth_ok(None, &p), "no header");
+        assert!(!auth_ok(Some("Basic !!!"), &p), "unparseable header");
+        assert!(!auth_ok(Some(&header("admin", "")), &p), "empty password");
+    }
+
+    #[test]
+    fn every_route_goes_through_the_auth_guard() {
+        // guarded() exists so that no handler carries its own copy of the auth
+        // check and none can be registered without one. That is only true if
+        // nothing calls fn_handler directly, which is a property of the source
+        // rather than of any value, so it is asserted against the source.
+        //
+        // Written because the claim was made and then immediately broken: the
+        // /version route went in with a bare fn_handler and served unauthenticated
+        // on the real device until someone happened to curl it.
+        let src = include_str!("main.rs");
+        // Split so this test does not match its own source and count itself.
+        let needle = concat!("server.", "fn_handler(");
+        let direct = src.matches(needle).count();
+        assert_eq!(
+            direct, 1,
+            "expected exactly one fn_handler call (the one inside guarded()); \
+             a route registered directly would not be behind the password"
+        );
+    }
+
+    #[test]
+    fn a_password_that_is_a_prefix_of_the_real_one_is_not_enough() {
+        // The bug this guards against is comparing only min(len) bytes.
+        let p = policy("admin", "hunter2");
+        assert!(!auth_ok(Some(&header("admin", "hunter")), &p));
+        assert!(!auth_ok(Some(&header("admin", "hunter22")), &p));
+    }
+}
+
+// Being wrong about any of these means a walk to the light with a usb cable,
+// which is the whole reason the decisions were factored out to be testable.
+#[cfg(all(test, not(target_os = "espidf")))]
+mod ota_tests {
+    use super::*;
+
+    const SLOT: usize = 0x1F_0000;
+
+    // A synthetic image header: magic, esp32 chip id, app descriptor magic.
+    fn header_bytes() -> Vec<u8> {
+        let mut head = vec![0u8; OTA_HEADER_PEEK];
+        head[0] = ESP_IMAGE_MAGIC;
+        head[12] = 0;
+        head[13] = 0;
+        head[32..36].copy_from_slice(&ESP_APP_DESC_MAGIC.to_le_bytes());
+        head
+    }
+
+    #[test]
+    fn a_real_looking_header_is_accepted() {
+        assert_eq!(validate_image_prefix(&header_bytes()), Ok(()));
+    }
+
+    #[test]
+    fn a_prefix_too_short_to_judge_is_not_yet_a_failure() {
+        // The header arrives a chunk at a time, so "not enough bytes to tell"
+        // has to mean "keep going", not "reject".
+        let head = header_bytes();
+        assert_eq!(validate_image_prefix(&[]), Ok(()));
+        assert_eq!(validate_image_prefix(&head[..1]), Ok(()));
+        assert_eq!(validate_image_prefix(&head[..13]), Ok(()));
+        assert_eq!(validate_image_prefix(&head[..35]), Ok(()));
+    }
+
+    #[test]
+    fn the_wrong_file_entirely_is_caught_on_the_first_byte() {
+        let mut head = header_bytes();
+        head[0] = b'#';
+        assert_eq!(validate_image_prefix(&head), Err(ImageProblem::BadMagic));
+        // ...and from a single byte, before anything is written to flash.
+        assert_eq!(
+            validate_image_prefix(&head[..1]),
+            Err(ImageProblem::BadMagic)
+        );
+    }
+
+    #[test]
+    fn an_image_for_another_chip_is_refused() {
+        let mut head = header_bytes();
+        head[12] = 9; // esp32-c3 and friends
+        assert_eq!(validate_image_prefix(&head), Err(ImageProblem::WrongChip));
+    }
+
+    #[test]
+    fn a_bootloader_or_merged_image_is_refused() {
+        let mut head = header_bytes();
+        head[32..36].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(
+            validate_image_prefix(&head),
+            Err(ImageProblem::NoAppDescriptor)
+        );
+    }
+
+    #[test]
+    fn a_body_of_a_plausible_size_is_accepted() {
+        assert_eq!(check_upload_size(Some(1_060_000), SLOT), Ok(1_060_000));
+        assert_eq!(check_upload_size(Some(SLOT as u64), SLOT), Ok(SLOT));
+    }
+
+    #[test]
+    fn a_chunked_body_is_refused_rather_than_read_forever() {
+        assert_eq!(
+            check_upload_size(None, SLOT),
+            Err(UploadProblem::LengthRequired)
+        );
+        assert_eq!(check_upload_size(None, SLOT).unwrap_err().status(), 411);
+    }
+
+    #[test]
+    fn something_far_too_small_to_be_firmware_is_refused() {
+        assert_eq!(
+            check_upload_size(Some(0), SLOT),
+            Err(UploadProblem::TooSmall(0))
+        );
+        assert_eq!(
+            check_upload_size(Some(4096), SLOT),
+            Err(UploadProblem::TooSmall(4096))
+        );
+    }
+
+    #[test]
+    fn an_image_that_will_not_fit_is_refused_before_a_byte_is_written() {
+        // The likely real mistake: a padded or merged image, which comes out
+        // flash-sized rather than app-sized.
+        let four_mb = 4 * 1024 * 1024;
+        let problem = check_upload_size(Some(four_mb), SLOT).unwrap_err();
+        assert_eq!(problem, UploadProblem::TooLarge(four_mb, SLOT));
+        assert_eq!(problem.status(), 413);
+        assert!(problem.message().contains("merged"));
+        assert_eq!(
+            check_upload_size(Some(SLOT as u64 + 1), SLOT)
+                .unwrap_err()
+                .status(),
+            413
+        );
+    }
+
+    #[test]
+    fn progress_runs_from_nothing_to_everything() {
+        assert_eq!(ota_progress_percent(0, 1000), 0);
+        assert_eq!(ota_progress_percent(500, 1000), 50);
+        assert_eq!(ota_progress_percent(1000, 1000), 100);
+    }
+
+    #[test]
+    fn progress_survives_a_big_image_and_an_empty_one() {
+        // written * 100 overflows a 32-bit multiply at these sizes, which is
+        // why the arithmetic is done in u64.
+        assert_eq!(ota_progress_percent(1_000_000, 1_063_430), 94);
+        assert_eq!(ota_progress_percent(0, 0), 0, "no divide by zero");
+        assert_eq!(ota_progress_percent(10, 5), 100, "clamped, not 200");
+    }
+
+    #[test]
+    fn an_unknown_expectation_never_causes_a_rollback() {
+        // A byte from some future firmware, or a half-written one, must not be
+        // read as a reason to revert. Rolling back on a guess is worse than
+        // not rolling back at all.
+        for stored in [None, Some(0), Some(3), Some(7), Some(255)] {
+            assert_eq!(OtaExpect::from_nvs(stored), OtaExpect::Nothing);
+        }
+        assert_eq!(OtaExpect::from_nvs(Some(1)), OtaExpect::Station);
+        assert_eq!(OtaExpect::from_nvs(Some(2)), OtaExpect::Ap);
+    }
+
+    #[test]
+    fn the_expectation_survives_a_round_trip_through_nvs() {
+        for expect in [OtaExpect::Nothing, OtaExpect::Station, OtaExpect::Ap] {
+            assert_eq!(OtaExpect::from_nvs(Some(expect.as_u8())), expect);
+        }
+    }
+
+    #[test]
+    fn an_image_that_promised_nothing_is_always_kept() {
+        // Flashed over serial, or already confirmed once.
+        for outcome in [
+            BootOutcome::Station,
+            BootOutcome::StationNoPortal,
+            BootOutcome::ApRequested,
+            BootOutcome::ApFallback,
+            BootOutcome::ApNoPortal,
+        ] {
+            assert_eq!(
+                health_verdict(OtaExpect::Nothing, outcome),
+                HealthVerdict::MarkValid,
+                "{:?}",
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_pushed_over_the_network_must_get_back_on_it() {
+        // This is the case the feature exists for: without it the boot-time
+        // fallback into setup mode makes an unreachable image look healthy.
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::ApFallback),
+            HealthVerdict::RollBack
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::Station),
+            HealthVerdict::MarkValid
+        );
+    }
+
+    #[test]
+    fn someone_holding_the_button_is_not_the_images_fault() {
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::ApRequested),
+            HealthVerdict::MarkValid
+        );
+    }
+
+    #[test]
+    fn an_image_nobody_could_replace_is_rolled_back() {
+        // On the network but not serving: no way in over the air, which is
+        // precisely what rollback is for.
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::StationNoPortal),
+            HealthVerdict::RollBack
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::ApNoPortal),
+            HealthVerdict::RollBack
+        );
+    }
+
+    #[test]
+    fn an_image_delivered_through_the_access_point_only_owes_an_access_point() {
+        // It has no network to rejoin, so requiring one would revert every
+        // update ever delivered in setup mode.
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::ApRequested),
+            HealthVerdict::MarkValid
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::ApFallback),
+            HealthVerdict::MarkValid
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::Station),
+            HealthVerdict::MarkValid
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::ApNoPortal),
+            HealthVerdict::RollBack
+        );
     }
 }
