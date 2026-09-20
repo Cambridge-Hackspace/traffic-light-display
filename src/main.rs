@@ -41,6 +41,7 @@ use {
     esp_idf_svc::http::Method,
     esp_idf_svc::io::EspIOError,
     esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs},
+    esp_idf_svc::ota::{EspOta, SlotState},
     esp_idf_svc::wifi::{
         AccessPointConfiguration, ClientConfiguration, Configuration as WifiConfiguration, EspWifi,
     },
@@ -49,6 +50,11 @@ use {
 
 // Default UDP port for the DDP listener. Overridable via NVS ("listen_port").
 const DEFAULT_LISTEN_PORT: u16 = 4048;
+
+// How many 10-second association attempts a boot gets before it gives up and
+// falls back to setup mode.
+#[cfg(target_os = "espidf")]
+const WIFI_CONNECT_ATTEMPTS: u32 = 3;
 
 // Where the setup portal is being served from. It decides what a Wi-Fi
 // credential change does: in setup mode the access point is torn down for a
@@ -145,6 +151,19 @@ fn main() {
             return;
         }
     };
+
+    // What this image has to do to earn its place, if it arrived over the air.
+    // Read here rather than further down so that the bail-outs between this
+    // point and the wifi connect are covered by the deadline below; anything
+    // that fails before NVS is available cannot be judged at all, and stays
+    // provisional so the bootloader reverts it at the next reboot.
+    let ota_expect = read_ota_expectation(&nvs_partition);
+    println!(
+        "> ota: running from {} ({:?} to prove)",
+        running_slot_label(),
+        ota_expect
+    );
+    arm_health_deadline(ota_expect, nvs_partition.clone());
 
     let sysloop = match EspSystemEventLoop::take() {
         Ok(s) => s,
@@ -316,24 +335,46 @@ fn main() {
                 }
             }
 
+            // Three 10-second attempts rather than one. A single transient
+            // auth timeout used to strand the light in setup mode until
+            // somebody power-cycled it, and now that a failure to connect can
+            // also mean rolling firmware back, one attempt is not enough
+            // evidence to act on.
             let mut connected = false;
             if started {
-                for _ in 0..100 {
-                    // 10 second timeout
-                    if wifi.is_connected().unwrap_or(false) {
-                        connected = true;
-                        break;
+                'attempts: for attempt in 1..=WIFI_CONNECT_ATTEMPTS {
+                    for _ in 0..100 {
+                        if wifi.is_connected().unwrap_or(false) {
+                            connected = true;
+                            break 'attempts;
+                        }
+                        FreeRtos::delay_ms(100);
                     }
-                    FreeRtos::delay_ms(100);
+                    if attempt < WIFI_CONNECT_ATTEMPTS {
+                        println!(
+                            "> wifi attempt {}/{} timed out; retrying",
+                            attempt, WIFI_CONNECT_ATTEMPTS
+                        );
+                        let _ = wifi.connect();
+                    }
                 }
             }
 
             if !connected {
                 // Boot-time safety net: a bad/unreachable saved network drops
                 // us straight into the captive portal rather than stranding.
+                // If this image was pushed over the network, though, failing to
+                // get back on it is exactly the failure worth reverting -- and
+                // this fallback is what would otherwise hide it.
                 println!("> failed to connect; re-entering ap mode");
+                settle_health(ota_expect, BootOutcome::ApFallback, &nvs_partition);
                 display.set_status_color(RGB8::new(50, 0, 0));
-                run_ap_mode(&mut wifi, nvs_partition.clone(), display.clone());
+                run_ap_mode(
+                    &mut wifi,
+                    nvs_partition.clone(),
+                    display.clone(),
+                    OtaExpect::Nothing,
+                );
             } else {
                 println!("> connected successfully");
                 display.set_status_color(RGB8::new(0, 50, 0));
@@ -364,12 +405,33 @@ fn main() {
                         ip
                     );
                 }
+                // Being on the network is not enough on its own: an image that
+                // cannot serve the portal is one nobody could replace over the
+                // air, which is the thing rollback exists to avoid.
+                settle_health(
+                    ota_expect,
+                    if portal.is_some() {
+                        BootOutcome::Station
+                    } else {
+                        BootOutcome::StationNoPortal
+                    },
+                    &nvs_partition,
+                );
             }
         }
         _ => {
             println!("> activating access point");
             display.set_status_color(RGB8::new(0, 0, 50));
-            run_ap_mode(&mut wifi, nvs_partition.clone(), display.clone());
+            // Setup mode entered on purpose, either because someone held BOOT
+            // or because there are no credentials to try. Either way it is a
+            // decision, not the image failing, so an image that expected the
+            // network still counts as healthy here.
+            run_ap_mode(
+                &mut wifi,
+                nvs_partition.clone(),
+                display.clone(),
+                ota_expect,
+            );
         }
     }
 
@@ -843,7 +905,12 @@ fn normalize_char(mut c: u8) -> u8 {
 }
 
 #[cfg(target_os = "espidf")]
-fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition, display: DisplayDriver) {
+fn run_ap_mode(
+    wifi: &mut EspWifi,
+    nvs_partition: EspDefaultNvsPartition,
+    display: DisplayDriver,
+    ota_expect: OtaExpect,
+) {
     println!("> scanning for wifi networks...");
 
     // temporarily switch to client mode to scan
@@ -867,14 +934,20 @@ fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition, displa
     let _server = match start_portal(
         PortalMode::Setup,
         ssids,
-        nvs_partition,
+        nvs_partition.clone(),
         display.clone(),
         Some(pending.clone()),
     ) {
-        Some(s) => s,
+        Some(s) => {
+            // Setup mode is up and serving, which is all an image delivered
+            // through the access point ever promised to do.
+            settle_health(ota_expect, BootOutcome::ApRequested, &nvs_partition);
+            s
+        }
         None => {
             // without the portal there is no way to finish setup
             println!("> fatal: setup portal unavailable");
+            settle_health(ota_expect, BootOutcome::ApNoPortal, &nvs_partition);
             loop {
                 FreeRtos::delay_ms(1000);
             }
@@ -893,10 +966,13 @@ fn run_ap_mode(wifi: &mut EspWifi, nvs_partition: EspDefaultNvsPartition, displa
     let mut last_marquee_update = Instant::now();
 
     loop {
-        // advance the live preview marquee
-        let (off, last) = marquee_tick(&display, marquee_offset, last_marquee_update);
-        marquee_offset = off;
-        last_marquee_update = last;
+        // advance the live preview marquee, unless firmware is being written,
+        // in which case the panels are showing the progress bar instead
+        if display.update_progress().is_none() {
+            let (off, last) = marquee_tick(&display, marquee_offset, last_marquee_update);
+            marquee_offset = off;
+            last_marquee_update = last;
+        }
 
         // handle any queued wifi test
         let job = match pending.lock() {
@@ -942,7 +1018,13 @@ fn start_portal(
     display: DisplayDriver,
     wifi_test: Option<WifiTestSlot>,
 ) -> Option<EspHttpServer<'static>> {
-    let server_config = HttpConfiguration::default();
+    let server_config = HttpConfiguration {
+        // The OTA handler decodes a header, holds a 4K chunk buffer and calls
+        // down into the flash driver. esp-idf-svc's default of 6K is not much
+        // room for that; the cost of the extra few kilobytes is one task.
+        stack_size: 10240,
+        ..Default::default()
+    };
     let mut server = match EspHttpServer::new(&server_config) {
         Ok(s) => s,
         Err(e) => {
@@ -968,7 +1050,13 @@ fn start_portal(
         guarded(&mut server, "/", Method::Get, auth.clone(), move |req| {
             let port = read_listen_port(&nvs_partition);
             let html = match page_auth.lock() {
-                Ok(policy) => render_portal(&ssids, &display, port, &mode, &policy),
+                Ok(policy) => {
+                    let firmware = RunningFirmware {
+                        version: env!("CARGO_PKG_VERSION").to_string(),
+                        slot: running_slot_label(),
+                    };
+                    render_portal(&ssids, &display, port, &mode, &policy, &firmware)
+                }
                 // Unreachable in practice: the guard this handler sits behind
                 // has already refused a poisoned lock. Serve something anyway
                 // rather than panic inside an http handler.
@@ -1219,6 +1307,198 @@ fn start_portal(
         );
     }
 
+    // ---- GET /version : what is running, for the push script to check ----
+    // Deliberately a new endpoint rather than an extension of /status, whose
+    // bare-word body the portal's own javascript string-compares.
+    {
+        let _ = server.fn_handler("/version", Method::Get, move |req| {
+            let uptime_ms = unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1000;
+            let state = EspOta::new()
+                .and_then(|ota| ota.get_running_slot())
+                .map(|slot| format!("{:?}", slot.state).to_lowercase())
+                .unwrap_or_else(|_| "unknown".to_string());
+            let body = format!(
+                concat!(
+                    "{{\"name\":\"{}\",\"version\":\"{}\",\"idf\":\"{}\",",
+                    "\"partition\":\"{}\",\"elf_sha256\":\"{}\",",
+                    "\"ota_state\":\"{}\",\"uptime_ms\":{}}}"
+                ),
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                running_idf_version(),
+                running_slot_label(),
+                running_elf_sha256(),
+                state,
+                uptime_ms,
+            );
+            let mut res = req.into_response(200, None, &[("Content-Type", "application/json")])?;
+            res.write_all(body.as_bytes())?;
+            Ok::<(), EspIOError>(())
+        });
+    }
+
+    // ---- POST /ota : a raw application image, straight into the spare slot ----
+    // The body is the bare .bin, so one endpoint serves both
+    // `curl --data-binary @app.bin` and a browser sending a File through XHR,
+    // and nothing here has to parse multipart.
+    {
+        let display = display.clone();
+        let nvs_partition = nvs_partition.clone();
+        let mode = mode.clone();
+        let ota_auth = auth.clone();
+        guarded(
+            &mut server,
+            "/ota",
+            Method::Post,
+            auth.clone(),
+            move |mut req| {
+                use std::sync::atomic::Ordering;
+
+                // An open portal will serve the settings page, but it will not
+                // run arbitrary code. This is the one place where "no password
+                // set" is refused rather than tolerated.
+                let configured = ota_auth
+                    .lock()
+                    .map(|policy| policy.is_configured())
+                    .unwrap_or(false);
+                if !configured {
+                    return plain_response(
+                        req,
+                        403,
+                        "set a portal password before uploading firmware",
+                    );
+                }
+
+                if OTA_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+                    return plain_response(req, 409, "another update is already running");
+                }
+                let _in_flight = OtaInFlight;
+
+                let slot = ota_slot_size();
+                let total = match check_upload_size(req.content_len(), slot) {
+                    Ok(n) => n,
+                    Err(problem) => {
+                        return plain_response(req, problem.status(), &problem.message())
+                    }
+                };
+
+                let mut ota = match EspOta::new() {
+                    Ok(ota) => ota,
+                    Err(e) => {
+                        println!("> ota: cannot reach the ota slots: {:?}", e);
+                        return plain_response(req, 500, "no ota slots on this device");
+                    }
+                };
+
+                // Someone authenticated and reached this endpoint, which is
+                // proof that the running image works well enough to be talked
+                // to. Confirm it, or esp_ota_begin refuses while the image is
+                // still provisional and the only way out would be a cable.
+                if let Ok(running) = ota.get_running_slot() {
+                    if running.state == SlotState::Unverified {
+                        println!("> ota: confirming the running image so it can be replaced");
+                        let _ = ota.mark_running_slot_valid();
+                        HEALTH_SETTLED.store(true, Ordering::SeqCst);
+                        clear_ota_expectation(&nvs_partition);
+                    }
+                }
+
+                let mut update = match ota.initiate_update() {
+                    Ok(update) => update,
+                    Err(e) => {
+                        println!("> ota: could not open the spare slot: {:?}", e);
+                        return plain_response(req, 500, "could not open the spare slot");
+                    }
+                };
+
+                if let Some(who) = req.header("X-OTA-Pusher") {
+                    println!("> ota: {} bytes incoming from {}", total, who);
+                } else {
+                    println!("> ota: {} bytes incoming", total);
+                }
+
+                display.begin_update();
+                let mut buf = vec![0u8; OTA_CHUNK];
+                let mut head: Vec<u8> = Vec::with_capacity(OTA_HEADER_PEEK);
+                let mut written = 0usize;
+                let mut last_percent = u8::MAX;
+                let mut failure: Option<(u16, String)> = None;
+
+                while written < total {
+                    let want = OTA_CHUNK.min(total - written);
+                    let n = match req.read(&mut buf[..want]) {
+                        Ok(0) => {
+                            failure = Some((400, "the body ended early".to_string()));
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(e) => {
+                            failure = Some((408, format!("upload stalled: {:?}", e)));
+                            break;
+                        }
+                    };
+                    if head.len() < OTA_HEADER_PEEK {
+                        let take = n.min(OTA_HEADER_PEEK - head.len());
+                        head.extend_from_slice(&buf[..take]);
+                        if let Err(problem) = validate_image_prefix(&head) {
+                            failure = Some((400, problem.message().to_string()));
+                            break;
+                        }
+                    }
+                    if let Err(e) = update.write(&buf[..n]) {
+                        failure = Some((500, format!("flash write failed: {:?}", e)));
+                        break;
+                    }
+                    written += n;
+                    let percent = ota_progress_percent(written, total);
+                    if percent != last_percent {
+                        display.set_update_progress(percent);
+                        last_percent = percent;
+                    }
+                }
+
+                if let Some((status, why)) = failure {
+                    let _ = update.abort();
+                    display.end_update();
+                    println!("> ota: gave up after {}/{} bytes: {}", written, total, why);
+                    return plain_response(req, status, &why);
+                }
+
+                // Record what this image has to prove before the boot pointer
+                // moves, so a power cut between the two cannot lose it.
+                let expect = match mode.as_ref() {
+                    PortalMode::Connected { .. } => OtaExpect::Station,
+                    PortalMode::Setup => OtaExpect::Ap,
+                };
+                write_ota_expectation(&nvs_partition, expect);
+
+                if let Err(e) = update.complete() {
+                    clear_ota_expectation(&nvs_partition);
+                    display.end_update();
+                    println!("> ota: esp-idf rejected the image: {:?}", e);
+                    return plain_response(req, 400, "the image failed esp-idf's own checks");
+                }
+
+                display.set_update_progress(100);
+                println!(
+                    "> ota: written, rebooting into it (must reach {:?})",
+                    expect
+                );
+
+                // Answer before rebooting, the same way POST /reboot does, or
+                // every successful push looks like a dropped connection.
+                plain_response(req, 200, "ok")?;
+                std::thread::spawn(|| {
+                    FreeRtos::delay_ms(1500);
+                    unsafe {
+                        esp_idf_svc::sys::esp_restart();
+                    }
+                });
+                Ok::<(), EspIOError>(())
+            },
+        );
+    }
+
     Some(server)
 }
 
@@ -1302,6 +1582,14 @@ const AUTH_NAMESPACE: &str = "sec_cfg";
 // password means the portal is open (see AuthPolicy::is_configured).
 #[cfg(any(target_os = "espidf", test))]
 const AUTH_USER_DEFAULT: &str = "admin";
+
+// What the portal page says about the image it is being served by. Passed in
+// rather than read inside the renderer, so the renderer stays pure and testable.
+#[cfg(any(target_os = "espidf", test))]
+pub struct RunningFirmware {
+    pub version: String,
+    pub slot: String,
+}
 
 #[cfg(any(target_os = "espidf", test))]
 pub struct AuthPolicy {
@@ -1492,8 +1780,410 @@ fn guarded<F>(
 }
 
 // --------------------------------------------------------
+// FIRMWARE UPDATES
+// --------------------------------------------------------
+// The device accepts a raw esp-idf application image as the body of a POST and
+// writes it into the spare app slot. The decisions -- is this plausibly our
+// firmware, is it going to fit, did the image that just booted actually work --
+// are pure functions so they can be tested off the device, which matters
+// because being wrong about any of them means a walk to the light with a cable.
+
+// Streamed in 4K pieces: one flash sector, and small enough that the buffer can
+// live on the heap without mattering. It must not be a stack array -- the httpd
+// task's stack is measured in single-digit kilobytes.
+#[cfg(target_os = "espidf")]
+const OTA_CHUNK: usize = 4096;
+
+// Enough of the head of the image to cover the esp_image_header_t (24 bytes),
+// the first segment header (8) and the start of the esp_app_desc_t that follows.
+#[cfg(any(target_os = "espidf", test))]
+const OTA_HEADER_PEEK: usize = 96;
+
+// The real firmware is ~1MB. Anything this small is a wrong file, not a build.
+#[cfg(any(target_os = "espidf", test))]
+const OTA_MIN_IMAGE: u64 = 256 * 1024;
+
+// Used only if the running slot cannot be interrogated; the real value comes
+// from the partition table (see partitions.csv).
+#[cfg(any(target_os = "espidf", test))]
+const OTA_SLOT_FALLBACK: usize = 0x1F_0000;
+
+// First byte of any esp-idf application image.
+#[cfg(any(target_os = "espidf", test))]
+const ESP_IMAGE_MAGIC: u8 = 0xE9;
+
+// esp_app_desc_t.magic_word, at offset 0x20 of the image.
+#[cfg(any(target_os = "espidf", test))]
+const ESP_APP_DESC_MAGIC: u32 = 0xABCD_5432;
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageProblem {
+    BadMagic,
+    WrongChip,
+    NoAppDescriptor,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl ImageProblem {
+    fn message(self) -> &'static str {
+        match self {
+            ImageProblem::BadMagic => "not an esp32 application image (bad magic byte)",
+            ImageProblem::WrongChip => "that image was built for a different chip",
+            ImageProblem::NoAppDescriptor => {
+                "no application descriptor -- is that a bootloader or a merged image?"
+            }
+        }
+    }
+}
+
+/// Check as much of the image header as has arrived so far. Called repeatedly
+/// as the first chunks come in, so a short prefix must be treated as "not yet
+/// known to be bad" rather than as an error.
+#[cfg(any(target_os = "espidf", test))]
+fn validate_image_prefix(head: &[u8]) -> Result<(), ImageProblem> {
+    if !head.is_empty() && head[0] != ESP_IMAGE_MAGIC {
+        return Err(ImageProblem::BadMagic);
+    }
+    if head.len() >= 14 {
+        // esp_image_header_t.chip_id, u16 LE at offset 12. ESP32 is 0.
+        if u16::from_le_bytes([head[12], head[13]]) != 0 {
+            return Err(ImageProblem::WrongChip);
+        }
+    }
+    if head.len() >= 36 {
+        let magic = u32::from_le_bytes([head[32], head[33], head[34], head[35]]);
+        if magic != ESP_APP_DESC_MAGIC {
+            return Err(ImageProblem::NoAppDescriptor);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UploadProblem {
+    LengthRequired,
+    TooSmall(u64),
+    TooLarge(u64, usize),
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl UploadProblem {
+    fn status(self) -> u16 {
+        match self {
+            UploadProblem::LengthRequired => 411,
+            UploadProblem::TooSmall(_) => 400,
+            UploadProblem::TooLarge(_, _) => 413,
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            UploadProblem::LengthRequired => {
+                "a Content-Length is required; this server cannot take a chunked body".to_string()
+            }
+            UploadProblem::TooSmall(n) => {
+                format!("{} bytes is far too small to be this firmware", n)
+            }
+            UploadProblem::TooLarge(n, slot) => format!(
+                "{} bytes will not fit the {} byte slot (a padded or merged image, perhaps?)",
+                n, slot
+            ),
+        }
+    }
+}
+
+/// Decide whether a body is worth starting an update for, before any of it is
+/// read. The most likely real mistake is a padded or merged image, which is
+/// flash-sized rather than app-sized, so that one gets its own hint.
+#[cfg(any(target_os = "espidf", test))]
+fn check_upload_size(content_len: Option<u64>, slot: usize) -> Result<usize, UploadProblem> {
+    let len = content_len.ok_or(UploadProblem::LengthRequired)?;
+    if len < OTA_MIN_IMAGE {
+        return Err(UploadProblem::TooSmall(len));
+    }
+    if len > slot as u64 {
+        return Err(UploadProblem::TooLarge(len, slot));
+    }
+    Ok(len as usize)
+}
+
+#[cfg(any(target_os = "espidf", test))]
+fn ota_progress_percent(written: usize, total: usize) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    ((written as u64 * 100 / total as u64).min(100)) as u8
+}
+
+// --------------------------------------------------------
+// ROLLBACK
+// --------------------------------------------------------
+// esp-idf boots a freshly written image in a provisional state and reverts to
+// the previous one unless the new image says it is working. What counts as
+// "working" here is whatever the light was already doing when the update was
+// accepted: an update delivered over the network has to get back on the
+// network, and one delivered through the setup access point has to bring that
+// access point back.
+
+#[cfg(target_os = "espidf")]
+const OTA_NAMESPACE: &str = "ota_cfg";
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OtaExpect {
+    /// Nothing to prove -- flashed over serial, or already confirmed.
+    Nothing,
+    Station,
+    Ap,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl OtaExpect {
+    /// Anything unrecognised degrades to "nothing to prove". A value written by
+    /// some future firmware, or a half-written byte, must never be read as a
+    /// reason to roll back -- rolling back on a guess is worse than not
+    /// rolling back at all.
+    pub fn from_nvs(stored: Option<u8>) -> Self {
+        match stored {
+            Some(1) => OtaExpect::Station,
+            Some(2) => OtaExpect::Ap,
+            _ => OtaExpect::Nothing,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            OtaExpect::Nothing => 0,
+            OtaExpect::Station => 1,
+            OtaExpect::Ap => 2,
+        }
+    }
+}
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootOutcome {
+    /// Joined the stored network and the portal is serving on it.
+    Station,
+    /// Joined, but the http server would not start.
+    StationNoPortal,
+    /// In setup mode because someone held BOOT, not because anything failed.
+    ApRequested,
+    /// In setup mode because the stored network could not be reached.
+    ApFallback,
+    /// Setup mode is up but its portal would not start.
+    ApNoPortal,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HealthVerdict {
+    MarkValid,
+    RollBack,
+}
+
+/// The whole rollback decision.
+#[cfg(any(target_os = "espidf", test))]
+fn health_verdict(expect: OtaExpect, outcome: BootOutcome) -> HealthVerdict {
+    use BootOutcome::*;
+    use HealthVerdict::*;
+    match (expect, outcome) {
+        // Nothing was promised, so nothing can be broken.
+        (OtaExpect::Nothing, _) => MarkValid,
+
+        (OtaExpect::Station, Station) => MarkValid,
+        // Someone held the button; that is a person choosing setup mode, not
+        // the new image failing to reach the network.
+        (OtaExpect::Station, ApRequested) => MarkValid,
+        // This is the case the whole feature exists for. The boot-time
+        // fallback into setup mode would otherwise make an image that cannot
+        // reach the network look perfectly healthy, forever.
+        (OtaExpect::Station, ApFallback) => RollBack,
+        // On the network but unreachable: no way to replace it over the air,
+        // which is the definition of needing a rollback.
+        (OtaExpect::Station, StationNoPortal) => RollBack,
+        (OtaExpect::Station, ApNoPortal) => RollBack,
+
+        // An update delivered over the setup access point has no network to
+        // rejoin, so only a portal that will not start counts as failure.
+        (OtaExpect::Ap, ApNoPortal) => RollBack,
+        (OtaExpect::Ap, _) => MarkValid,
+    }
+}
+
+// Where the running image's promise is kept across the reboot that follows an
+// update. Written just before the boot pointer moves, read on the next boot,
+// and cleared as soon as a verdict is reached.
+#[cfg(target_os = "espidf")]
+fn read_ota_expectation(nvs_partition: &EspDefaultNvsPartition) -> OtaExpect {
+    match EspNvs::new(nvs_partition.clone(), OTA_NAMESPACE, true) {
+        Ok(nvs) => OtaExpect::from_nvs(nvs.get_u8("expect").ok().flatten()),
+        Err(_) => OtaExpect::Nothing,
+    }
+}
+
+#[cfg(target_os = "espidf")]
+fn write_ota_expectation(nvs_partition: &EspDefaultNvsPartition, expect: OtaExpect) {
+    if let Ok(nvs) = EspNvs::new(nvs_partition.clone(), OTA_NAMESPACE, true) {
+        let _ = nvs.set_u8("expect", expect.as_u8());
+    }
+}
+
+#[cfg(target_os = "espidf")]
+fn clear_ota_expectation(nvs_partition: &EspDefaultNvsPartition) {
+    if let Ok(mut nvs) = EspNvs::new(nvs_partition.clone(), OTA_NAMESPACE, true) {
+        let _ = nvs.remove("expect");
+    }
+}
+
+// Set once a verdict has been reached, so the watchdog below knows not to fire.
+#[cfg(target_os = "espidf")]
+static HEALTH_SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Only one update at a time. Two interleaved writes into the same slot produce
+// something shaped like firmware that is not firmware.
+#[cfg(target_os = "espidf")]
+static OTA_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Deliver the verdict on the running image and act on it. Does not return in
+/// the rollback case -- esp-idf reboots into the previous image.
+#[cfg(target_os = "espidf")]
+fn settle_health(expect: OtaExpect, outcome: BootOutcome, nvs_partition: &EspDefaultNvsPartition) {
+    use std::sync::atomic::Ordering;
+    if HEALTH_SETTLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Clear first, in both branches. After a rollback the *previous* image
+    // boots this same code; a surviving expectation would make it roll back
+    // again the moment the network happened to be down, and the two slots
+    // would take turns rejecting each other forever.
+    clear_ota_expectation(nvs_partition);
+
+    match health_verdict(expect, outcome) {
+        HealthVerdict::MarkValid => {
+            if let Ok(mut ota) = EspOta::new() {
+                match ota.mark_running_slot_valid() {
+                    Ok(()) => println!("> ota: image confirmed ({:?} after {:?})", expect, outcome),
+                    Err(e) => println!("> ota: could not confirm image: {:?}", e),
+                }
+            }
+        }
+        HealthVerdict::RollBack => {
+            println!(
+                "> ota: this image was supposed to reach {:?} and got {:?}; rolling back",
+                expect, outcome
+            );
+            if let Ok(mut ota) = EspOta::new() {
+                // Returns only on failure, e.g. when there is no previous
+                // image to go back to.
+                let e = ota.mark_running_slot_invalid_and_reboot();
+                println!("> ota: rollback failed: {:?}; carrying on", e);
+            }
+        }
+    }
+}
+
+/// Backstop for the paths that never reach a verdict -- no peripherals, no NVS,
+/// no wifi driver -- which would otherwise sit provisionally-booted forever,
+/// neither confirmed nor rolled back.
+#[cfg(target_os = "espidf")]
+fn arm_health_deadline(expect: OtaExpect, nvs_partition: EspDefaultNvsPartition) {
+    use std::sync::atomic::Ordering;
+    if expect == OtaExpect::Nothing {
+        return;
+    }
+    let _ = std::thread::Builder::new().stack_size(4096).spawn(move || {
+        FreeRtos::delay_ms(180_000);
+        if HEALTH_SETTLED.load(Ordering::SeqCst) {
+            return;
+        }
+        println!("> ota: three minutes with no verdict; treating that as a failure");
+        settle_health(expect, BootOutcome::ApNoPortal, &nvs_partition);
+    });
+}
+
+/// Size of the slot an update would be written into.
+#[cfg(target_os = "espidf")]
+fn ota_slot_size() -> usize {
+    let part = unsafe { esp_idf_svc::sys::esp_ota_get_next_update_partition(core::ptr::null()) };
+    if part.is_null() {
+        OTA_SLOT_FALLBACK
+    } else {
+        unsafe { (*part).size as usize }
+    }
+}
+
+/// Label of the app partition currently running, for the version endpoint.
+#[cfg(target_os = "espidf")]
+fn running_slot_label() -> String {
+    let part = unsafe { esp_idf_svc::sys::esp_ota_get_running_partition() };
+    if part.is_null() {
+        return "?".to_string();
+    }
+    let label = unsafe { core::ffi::CStr::from_ptr((*part).label.as_ptr()) };
+    label.to_string_lossy().into_owned()
+}
+
+/// The esp-idf version this image was built against, from the descriptor
+/// esp-idf itself writes into the image.
+#[cfg(target_os = "espidf")]
+fn running_idf_version() -> String {
+    let desc = unsafe { esp_idf_svc::sys::esp_app_get_description() };
+    if desc.is_null() {
+        return String::new();
+    }
+    let raw = unsafe { core::ffi::CStr::from_ptr((*desc).idf_ver.as_ptr()) };
+    raw.to_string_lossy().into_owned()
+}
+
+/// The SHA-256 esp-idf stamps into the image, as hex. This is what identifies
+/// one build from another: the version string does not change while you are
+/// iterating, and the descriptor's own version field is a git-describe of
+/// esp-idf-sys's dummy cmake project rather than of this crate.
+#[cfg(target_os = "espidf")]
+fn running_elf_sha256() -> String {
+    let desc = unsafe { esp_idf_svc::sys::esp_app_get_description() };
+    if desc.is_null() {
+        return String::new();
+    }
+    let sha = unsafe { (*desc).app_elf_sha256 };
+    let mut out = String::with_capacity(64);
+    for b in sha {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+// --------------------------------------------------------
 // HTTP HELPERS (ESP32 ONLY)
 // --------------------------------------------------------
+// Plain-text reply for the endpoints a script talks to, where the status code
+// carries the meaning and the body just says why.
+#[cfg(target_os = "espidf")]
+fn plain_response(
+    req: Request<&mut EspHttpConnection<'_>>,
+    status: u16,
+    message: &str,
+) -> Result<(), EspIOError> {
+    let mut res = req.into_response(status, None, &[("Content-Type", "text/plain")])?;
+    res.write_all(message.as_bytes())?;
+    res.write_all(b"\n")?;
+    Ok(())
+}
+
+// Releases the single-flight flag however the handler leaves.
+#[cfg(target_os = "espidf")]
+struct OtaInFlight;
+
+#[cfg(target_os = "espidf")]
+impl Drop for OtaInFlight {
+    fn drop(&mut self) {
+        OTA_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(target_os = "espidf")]
 fn read_body<R>(req: &mut R) -> String
 where
@@ -1570,6 +2260,7 @@ fn render_portal(
     listen_port: u16,
     mode: &PortalMode,
     auth: &AuthPolicy,
+    firmware: &RunningFirmware,
 ) -> String {
     let cfg = display.marquee_config();
     // An unconfigured portal is open to everyone who can reach it, which is
@@ -1582,6 +2273,17 @@ fn render_portal(
             .to_string()
     };
     let auth_user = html_escape(&auth.user);
+    // Uploading firmware runs whatever is uploaded, so unlike the rest of the
+    // page it is not offered at all until there is a password to gate it.
+    let firmware_control = if auth.is_configured() {
+        "<div class=\"form-group\">\n        <input type=\"file\" id=\"fw\" accept=\".bin\" />\n      </div>\n               <div id=\"fw_status\" class=\"status idle\">Choose a .bin built by <code>cargo build --release</code>.</div>\n               <button onclick=\"uploadFirmware()\">Upload firmware</button>"
+            .to_string()
+    } else {
+        "<div class=\"status failed\">Set a portal password above before uploading firmware.</div>"
+            .to_string()
+    };
+    let fw_version = html_escape(&firmware.version);
+    let fw_slot = html_escape(&firmware.slot);
     let (mode_note, reboot_note) = match mode {
         PortalMode::Setup => (String::new(), "The setup portal will close.".to_string()),
         PortalMode::Connected { ip } => (
@@ -1718,6 +2420,42 @@ fn render_portal(
             || d.panel_margin !== SAVED.panel_margin
             || d.margin_streams !== SAVED.margin_streams
             || d.listen_port !== SAVED.listen_port;
+      }}
+
+      // Firmware goes up as the raw file, not multipart: the device reads the
+      // body straight into flash, and the same endpoint then works from a
+      // shell with `curl --data-binary @app.bin`. XMLHttpRequest rather than
+      // fetch() because only XHR reports upload progress, and a megabyte over
+      // wifi is long enough that a progress bar is the difference between
+      // "working" and "hung".
+      function uploadFirmware() {{
+        var f = document.getElementById("fw").files[0];
+        var box = document.getElementById("fw_status");
+        if (!f) {{ alert("Choose a .bin first."); return; }}
+        if (!confirm("Upload " + f.name + " (" + Math.round(f.size / 1024) + " KB) and reboot into it?")) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", "/ota", true);
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        xhr.upload.onprogress = function(e) {{
+          if (!e.lengthComputable) return;
+          box.className = "status testing";
+          box.textContent = "Uploading " + Math.floor(100 * e.loaded / e.total) + "% - watch the lamps.";
+        }};
+        xhr.onload = function() {{
+          if (xhr.status === 200) {{
+            box.className = "status success";
+            box.textContent = "Written. Rebooting into it; this page will come back in a few seconds.";
+            setTimeout(function() {{ location.reload(); }}, 15000);
+          }} else {{
+            box.className = "status failed";
+            box.textContent = "Refused (" + xhr.status + "): " + xhr.responseText;
+          }}
+        }};
+        xhr.onerror = function() {{
+          box.className = "status failed";
+          box.textContent = "The connection dropped during the upload. Nothing was changed.";
+        }};
+        xhr.send(f);
       }}
 
       // The portal password is saved on its own rather than through the reboot
@@ -1857,6 +2595,13 @@ fn render_portal(
       <button onclick="savePortalAuth()">Set portal password</button>
       <button onclick="clearPortalAuth()">Remove password</button>
 
+      <h3>Firmware</h3>
+      <div class="form-group">
+        <label>Running <span class="hint">(version, and which of the two slots it booted from)</span></label>
+        <div>{fw_version} from {fw_slot}</div>
+      </div>
+      {firmware_control}
+
       <button onclick="doReboot()">Reboot</button>
     </div>
   </body>
@@ -1864,6 +2609,9 @@ fn render_portal(
         mode_note = mode_note,
         auth_note = auth_note,
         auth_user = auth_user,
+        firmware_control = firmware_control,
+        fw_version = fw_version,
+        fw_slot = fw_slot,
         reboot_note = reboot_note,
         status_class = wifi_status_class(display),
         status_text = wifi_status_text(display),
@@ -2105,7 +2853,11 @@ mod portal_tests {
 
     fn page_with(mode: PortalMode, auth: &AuthPolicy) -> String {
         let display = DisplayDriver::new_simulated();
-        render_portal(&["lab".to_string()], &display, 4048, &mode, auth)
+        let firmware = RunningFirmware {
+            version: "9.9.9".to_string(),
+            slot: "ota_1".to_string(),
+        };
+        render_portal(&["lab".to_string()], &display, 4048, &mode, auth, &firmware)
     }
 
     #[test]
@@ -2133,6 +2885,23 @@ mod portal_tests {
         });
         assert!(!p.contains("at <script>"));
         assert!(p.contains("at &lt;script&gt;"));
+    }
+
+    #[test]
+    fn the_page_shows_what_is_running_and_offers_an_upload() {
+        let p = page_with(PortalMode::Setup, &locked());
+        assert!(p.contains("9.9.9 from ota_1"));
+        assert!(p.contains("id=\"fw\""));
+        assert!(p.contains("xhr.open(\"POST\", \"/ota\", true)"));
+    }
+
+    #[test]
+    fn an_unprotected_portal_does_not_offer_firmware_upload() {
+        // The endpoint refuses in this state anyway; not drawing the control
+        // is so the page says why rather than failing when it is used.
+        let p = page_with(PortalMode::Setup, &open());
+        assert!(!p.contains("id=\"fw\""));
+        assert!(p.contains("Set a portal password above before uploading firmware"));
     }
 
     #[test]
@@ -2316,5 +3085,225 @@ mod auth_tests {
         let p = policy("admin", "hunter2");
         assert!(!auth_ok(Some(&header("admin", "hunter")), &p));
         assert!(!auth_ok(Some(&header("admin", "hunter22")), &p));
+    }
+}
+
+// Being wrong about any of these means a walk to the light with a usb cable,
+// which is the whole reason the decisions were factored out to be testable.
+#[cfg(all(test, not(target_os = "espidf")))]
+mod ota_tests {
+    use super::*;
+
+    const SLOT: usize = 0x1F_0000;
+
+    // A synthetic image header: magic, esp32 chip id, app descriptor magic.
+    fn header_bytes() -> Vec<u8> {
+        let mut head = vec![0u8; OTA_HEADER_PEEK];
+        head[0] = ESP_IMAGE_MAGIC;
+        head[12] = 0;
+        head[13] = 0;
+        head[32..36].copy_from_slice(&ESP_APP_DESC_MAGIC.to_le_bytes());
+        head
+    }
+
+    #[test]
+    fn a_real_looking_header_is_accepted() {
+        assert_eq!(validate_image_prefix(&header_bytes()), Ok(()));
+    }
+
+    #[test]
+    fn a_prefix_too_short_to_judge_is_not_yet_a_failure() {
+        // The header arrives a chunk at a time, so "not enough bytes to tell"
+        // has to mean "keep going", not "reject".
+        let head = header_bytes();
+        assert_eq!(validate_image_prefix(&[]), Ok(()));
+        assert_eq!(validate_image_prefix(&head[..1]), Ok(()));
+        assert_eq!(validate_image_prefix(&head[..13]), Ok(()));
+        assert_eq!(validate_image_prefix(&head[..35]), Ok(()));
+    }
+
+    #[test]
+    fn the_wrong_file_entirely_is_caught_on_the_first_byte() {
+        let mut head = header_bytes();
+        head[0] = b'#';
+        assert_eq!(validate_image_prefix(&head), Err(ImageProblem::BadMagic));
+        // ...and from a single byte, before anything is written to flash.
+        assert_eq!(
+            validate_image_prefix(&head[..1]),
+            Err(ImageProblem::BadMagic)
+        );
+    }
+
+    #[test]
+    fn an_image_for_another_chip_is_refused() {
+        let mut head = header_bytes();
+        head[12] = 9; // esp32-c3 and friends
+        assert_eq!(validate_image_prefix(&head), Err(ImageProblem::WrongChip));
+    }
+
+    #[test]
+    fn a_bootloader_or_merged_image_is_refused() {
+        let mut head = header_bytes();
+        head[32..36].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(
+            validate_image_prefix(&head),
+            Err(ImageProblem::NoAppDescriptor)
+        );
+    }
+
+    #[test]
+    fn a_body_of_a_plausible_size_is_accepted() {
+        assert_eq!(check_upload_size(Some(1_060_000), SLOT), Ok(1_060_000));
+        assert_eq!(check_upload_size(Some(SLOT as u64), SLOT), Ok(SLOT));
+    }
+
+    #[test]
+    fn a_chunked_body_is_refused_rather_than_read_forever() {
+        assert_eq!(
+            check_upload_size(None, SLOT),
+            Err(UploadProblem::LengthRequired)
+        );
+        assert_eq!(check_upload_size(None, SLOT).unwrap_err().status(), 411);
+    }
+
+    #[test]
+    fn something_far_too_small_to_be_firmware_is_refused() {
+        assert_eq!(
+            check_upload_size(Some(0), SLOT),
+            Err(UploadProblem::TooSmall(0))
+        );
+        assert_eq!(
+            check_upload_size(Some(4096), SLOT),
+            Err(UploadProblem::TooSmall(4096))
+        );
+    }
+
+    #[test]
+    fn an_image_that_will_not_fit_is_refused_before_a_byte_is_written() {
+        // The likely real mistake: a padded or merged image, which comes out
+        // flash-sized rather than app-sized.
+        let four_mb = 4 * 1024 * 1024;
+        let problem = check_upload_size(Some(four_mb), SLOT).unwrap_err();
+        assert_eq!(problem, UploadProblem::TooLarge(four_mb, SLOT));
+        assert_eq!(problem.status(), 413);
+        assert!(problem.message().contains("merged"));
+        assert_eq!(
+            check_upload_size(Some(SLOT as u64 + 1), SLOT)
+                .unwrap_err()
+                .status(),
+            413
+        );
+    }
+
+    #[test]
+    fn progress_runs_from_nothing_to_everything() {
+        assert_eq!(ota_progress_percent(0, 1000), 0);
+        assert_eq!(ota_progress_percent(500, 1000), 50);
+        assert_eq!(ota_progress_percent(1000, 1000), 100);
+    }
+
+    #[test]
+    fn progress_survives_a_big_image_and_an_empty_one() {
+        // written * 100 overflows a 32-bit multiply at these sizes, which is
+        // why the arithmetic is done in u64.
+        assert_eq!(ota_progress_percent(1_000_000, 1_063_430), 94);
+        assert_eq!(ota_progress_percent(0, 0), 0, "no divide by zero");
+        assert_eq!(ota_progress_percent(10, 5), 100, "clamped, not 200");
+    }
+
+    #[test]
+    fn an_unknown_expectation_never_causes_a_rollback() {
+        // A byte from some future firmware, or a half-written one, must not be
+        // read as a reason to revert. Rolling back on a guess is worse than
+        // not rolling back at all.
+        for stored in [None, Some(0), Some(3), Some(7), Some(255)] {
+            assert_eq!(OtaExpect::from_nvs(stored), OtaExpect::Nothing);
+        }
+        assert_eq!(OtaExpect::from_nvs(Some(1)), OtaExpect::Station);
+        assert_eq!(OtaExpect::from_nvs(Some(2)), OtaExpect::Ap);
+    }
+
+    #[test]
+    fn the_expectation_survives_a_round_trip_through_nvs() {
+        for expect in [OtaExpect::Nothing, OtaExpect::Station, OtaExpect::Ap] {
+            assert_eq!(OtaExpect::from_nvs(Some(expect.as_u8())), expect);
+        }
+    }
+
+    #[test]
+    fn an_image_that_promised_nothing_is_always_kept() {
+        // Flashed over serial, or already confirmed once.
+        for outcome in [
+            BootOutcome::Station,
+            BootOutcome::StationNoPortal,
+            BootOutcome::ApRequested,
+            BootOutcome::ApFallback,
+            BootOutcome::ApNoPortal,
+        ] {
+            assert_eq!(
+                health_verdict(OtaExpect::Nothing, outcome),
+                HealthVerdict::MarkValid,
+                "{:?}",
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_pushed_over_the_network_must_get_back_on_it() {
+        // This is the case the feature exists for: without it the boot-time
+        // fallback into setup mode makes an unreachable image look healthy.
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::ApFallback),
+            HealthVerdict::RollBack
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::Station),
+            HealthVerdict::MarkValid
+        );
+    }
+
+    #[test]
+    fn someone_holding_the_button_is_not_the_images_fault() {
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::ApRequested),
+            HealthVerdict::MarkValid
+        );
+    }
+
+    #[test]
+    fn an_image_nobody_could_replace_is_rolled_back() {
+        // On the network but not serving: no way in over the air, which is
+        // precisely what rollback is for.
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::StationNoPortal),
+            HealthVerdict::RollBack
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Station, BootOutcome::ApNoPortal),
+            HealthVerdict::RollBack
+        );
+    }
+
+    #[test]
+    fn an_image_delivered_through_the_access_point_only_owes_an_access_point() {
+        // It has no network to rejoin, so requiring one would revert every
+        // update ever delivered in setup mode.
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::ApRequested),
+            HealthVerdict::MarkValid
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::ApFallback),
+            HealthVerdict::MarkValid
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::Station),
+            HealthVerdict::MarkValid
+        );
+        assert_eq!(
+            health_verdict(OtaExpect::Ap, BootOutcome::ApNoPortal),
+            HealthVerdict::RollBack
+        );
     }
 }

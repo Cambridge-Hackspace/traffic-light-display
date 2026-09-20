@@ -194,6 +194,11 @@ pub struct DisplayState {
 
     // last wifi connection test outcome (RAM only, shown in portal)
     wifi_test: WifiTestResult,
+
+    // Some(0..=100) while a firmware image is being written. While it is set
+    // the render thread ignores `image` entirely and the setters below refuse
+    // updates, so a DDP stream or the marquee cannot fight the progress bar.
+    update_progress: Option<u8>,
 }
 
 #[derive(Clone)]
@@ -213,6 +218,7 @@ impl DisplayState {
             panel_margin: PANEL_MARGIN_DEFAULT,
             margin_applies_streams: PANEL_MARGIN_STREAMS_DEFAULT,
             wifi_test: WifiTestResult::Idle,
+            update_progress: None,
         }
     }
 }
@@ -247,9 +253,13 @@ impl DisplayDriver {
             let mut pixels = [RGB8::default(); STRIP_LEN];
 
             loop {
-                let (status_color, image) = {
+                let (status_color, image, updating) = {
                     let lock = state_clone.lock().unwrap();
-                    (lock.status_color, lock.image)
+                    (lock.status_color, lock.image, lock.update_progress)
+                };
+                let image = match updating {
+                    Some(percent) => ota_progress_image(percent),
+                    None => image,
                 };
 
                 // Sliding gradient over the sacrificial LEDs. With a run of
@@ -278,7 +288,11 @@ impl DisplayDriver {
                 }
 
                 tick = tick.wrapping_add(1);
-                FreeRtos::delay_ms(33);
+                // Writing flash parks the cache, and this thread's code is not
+                // in IRAM, so frames issued during an erase can tear. Refreshing
+                // 5x/s instead of 30x/s during an update means far fewer torn
+                // frames, and a bar that counts up in steps still reads fine.
+                FreeRtos::delay_ms(if updating.is_some() { 200 } else { 33 });
             }
         });
 
@@ -295,20 +309,64 @@ impl DisplayDriver {
         }
     }
 
+    // Both of these are ignored while a firmware update is in flight. Gating
+    // them here rather than at each call site means every existing caller --
+    // the DDP listener, the marquee, the once-a-second status colour rotation
+    // -- is handled without being touched, and no future one can forget.
+
     pub fn set_status_color(&self, color: RGB8) {
         if let Ok(mut lock) = self.state.lock() {
+            if lock.update_progress.is_some() {
+                return;
+            }
             lock.status_color = color;
         }
     }
 
     pub fn set_image(&self, image: &[u8; 300]) {
         if let Ok(mut lock) = self.state.lock() {
+            if lock.update_progress.is_some() {
+                return;
+            }
             #[cfg(feature = "console-sim")]
             if lock.image != *image {
                 Self::print_sim(image);
             }
             lock.image.copy_from_slice(image);
         }
+    }
+
+    // --------------------------------------------------------
+    // FIRMWARE UPDATE DISPLAY
+    // --------------------------------------------------------
+
+    /// Take the panels over for the duration of a firmware update.
+    pub fn begin_update(&self) {
+        if let Ok(mut lock) = self.state.lock() {
+            lock.update_progress = Some(0);
+            // Amber on the sacrificial LED: distinct from the red/green/blue
+            // this uses for wifi state, so "updating" reads from across the
+            // room even when the bar is still empty.
+            lock.status_color = RGB8::new(60, 40, 0);
+        }
+    }
+
+    pub fn set_update_progress(&self, percent: u8) {
+        if let Ok(mut lock) = self.state.lock() {
+            lock.update_progress = Some(percent.min(100));
+        }
+    }
+
+    /// Hand the panels back. Only reached when an update fails: a successful
+    /// one reboots instead.
+    pub fn end_update(&self) {
+        if let Ok(mut lock) = self.state.lock() {
+            lock.update_progress = None;
+        }
+    }
+
+    pub fn update_progress(&self) -> Option<u8> {
+        self.state.lock().ok().and_then(|lock| lock.update_progress)
     }
 
     // --------------------------------------------------------
@@ -463,8 +521,123 @@ impl DisplayDriver {
 
 /// Truncate a string to at most `max` characters (not bytes), preserving
 /// whole UTF-8 characters. Used to bound marquee text everywhere it enters.
+/// The three lamps as a progress meter, filling bottom-up and left-to-right:
+/// red fills first, then amber, then blue. Logical x runs across the three
+/// panels in that order (see `get_pixel_index`), so a full bar is the whole
+/// display lit and a half bar is red plus half of amber.
+#[cfg(any(target_os = "espidf", test))]
+pub fn ota_progress_image(percent: u8) -> [u8; 300] {
+    // Bright enough to read across a room, dim enough not to be the brightest
+    // thing the light has ever done.
+    const LIT: u8 = 110;
+    let percent = percent.min(100) as usize;
+    let mut img = [0u8; 300];
+    // One "row" of fill per lamp-row: 3 lamps x 10 rows = 30 steps.
+    let filled = (percent * 30 + 50) / 100;
+    for lamp in 0..PANEL_COUNT {
+        let rows = filled.saturating_sub(lamp * PANEL_SIZE).min(PANEL_SIZE);
+        for r in 0..rows {
+            let y = (PANEL_SIZE - 1) - r; // fill from the bottom of the lamp
+            for x in (lamp * PANEL_SIZE)..(lamp * PANEL_SIZE + PANEL_SIZE) {
+                img[y * 30 + x] = LIT;
+            }
+        }
+    }
+    img
+}
+
 pub fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+// The simulated driver these lean on only exists off-target, and clippy builds
+// test targets for the esp32 too, so this module is host-only. Tests are run on
+// the host anyway.
+#[cfg(all(test, not(target_os = "espidf")))]
+mod ota_display_tests {
+    use super::*;
+
+    fn lit(img: &[u8; 300]) -> usize {
+        img.iter().filter(|&&v| v > 0).count()
+    }
+
+    fn lamp_lit(img: &[u8; 300], lamp: usize) -> usize {
+        let mut n = 0;
+        for y in 0..PANEL_SIZE {
+            for x in (lamp * PANEL_SIZE)..(lamp * PANEL_SIZE + PANEL_SIZE) {
+                if img[y * 30 + x] > 0 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn an_empty_bar_is_dark_and_a_full_one_is_lit() {
+        assert_eq!(lit(&ota_progress_image(0)), 0);
+        assert_eq!(lit(&ota_progress_image(100)), 300);
+    }
+
+    #[test]
+    fn the_bar_fills_red_then_amber_then_blue() {
+        // Half way: the red lamp is full, amber is half, blue is dark.
+        let img = ota_progress_image(50);
+        assert_eq!(lamp_lit(&img, 0), 100, "red lamp full");
+        assert_eq!(lamp_lit(&img, 1), 50, "amber lamp half");
+        assert_eq!(lamp_lit(&img, 2), 0, "blue lamp dark");
+    }
+
+    #[test]
+    fn the_bar_fills_from_the_bottom_of_each_lamp() {
+        // One row of the red lamp: the bottom row, not the top.
+        let img = ota_progress_image(3);
+        assert!(img[9 * 30] > 0, "bottom row lit");
+        assert_eq!(img[0], 0, "top row dark");
+    }
+
+    #[test]
+    fn the_bar_never_goes_backwards() {
+        let mut last = 0;
+        for p in 0..=100u8 {
+            let now = lit(&ota_progress_image(p));
+            assert!(now >= last, "{}% lit fewer pixels than {}%", p, p - 1);
+            last = now;
+        }
+    }
+
+    #[test]
+    fn a_percentage_over_a_hundred_is_clamped_rather_than_panicking() {
+        assert_eq!(ota_progress_image(255), ota_progress_image(100));
+    }
+
+    #[test]
+    fn an_update_in_flight_locks_out_the_animation() {
+        // This is the property the whole design leans on: the DDP listener and
+        // the marquee keep calling set_image during an upload, and they must
+        // not be able to overwrite the progress bar.
+        let d = DisplayDriver::new_simulated();
+        d.set_image(&[7; 300]);
+        d.begin_update();
+        d.set_image(&[42; 300]);
+        d.set_status_color(RGB8::new(1, 2, 3));
+        assert_eq!(d.update_progress(), Some(0));
+
+        let state = d.state.lock().unwrap();
+        assert_eq!(state.image[0], 7, "set_image was ignored");
+        assert_ne!(state.status_color, RGB8::new(1, 2, 3), "colour was ignored");
+    }
+
+    #[test]
+    fn the_display_comes_back_when_an_update_fails() {
+        let d = DisplayDriver::new_simulated();
+        d.begin_update();
+        d.set_image(&[42; 300]);
+        d.end_update();
+        assert_eq!(d.update_progress(), None);
+        d.set_image(&[99; 300]);
+        assert_eq!(d.state.lock().unwrap().image[0], 99);
+    }
 }
 
 #[cfg(test)]
