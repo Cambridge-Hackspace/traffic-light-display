@@ -13,6 +13,7 @@ use {
     esp_idf_hal::gpio::{PinDriver, Pull},
     esp_idf_hal::io::{Read, Write},
     esp_idf_hal::peripherals::Peripherals,
+    esp_idf_hal::rmt::{config::TransmitConfig, TxRmtDriver},
     esp_idf_svc::eventloop::EspSystemEventLoop,
     esp_idf_svc::handle::RawHandle,
     esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer},
@@ -41,7 +42,24 @@ fn main() {
     // set up combined LED strip (status + screen) - pin D13 on the ESP32
     let led_pin = peripherals.pins.gpio13;
     let led_channel = peripherals.rmt.channel0;
-    let led_strip = Ws2812Esp32Rmt::new(led_channel, led_pin).unwrap();
+    // The WS2812 crate's default RMT config uses a single 64-symbol memory
+    // block, so the RMT interrupt must refill the hardware every 32 symbols
+    // (~40us). Any interrupt latency on the core (wifi driver critical
+    // sections, in particular) longer than that starves the peripheral, which
+    // the strip sees as a reset gap: the rest of the frame is latched into the
+    // wrong LEDs and the display flickers. Channel 0 on the ESP32 can own all
+    // eight blocks (512 symbols), which stretches the refill deadline to ~320us.
+    const LED_RMT_MEM_BLOCKS: u8 = 8;
+    let led_cfg = TransmitConfig::new()
+        .clock_divider(1)
+        .mem_block_num(LED_RMT_MEM_BLOCKS);
+    let led_tx = TxRmtDriver::new(led_channel, led_pin, &led_cfg).unwrap();
+    let led_strip = Ws2812Esp32Rmt::new_with_rmt_driver(led_tx).unwrap();
+    println!(
+        "> rmt: mem_block_num={} ({} symbols)",
+        LED_RMT_MEM_BLOCKS,
+        LED_RMT_MEM_BLOCKS as u32 * 64
+    );
 
     // set up non-volatile storage on the ESP32
     let nvs_partition = EspDefaultNvsPartition::take().unwrap();
