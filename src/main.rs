@@ -161,7 +161,7 @@ fn main() {
                 if boot_btn.is_low() {
                     pressed_time += 1;
                     if pressed_time >= 50 {
-                        if let Ok(mut nvs) = EspNvs::new(nvs_part_clone.clone(), "wifi_cfg", true) {
+                        if let Ok(nvs) = EspNvs::new(nvs_part_clone.clone(), "wifi_cfg", true) {
                             let _ = nvs.set_u8("wap_mode", 1);
                         }
                         println!("> reboot into wireless setup");
@@ -663,7 +663,7 @@ fn marquee_span(text: &str, orientation: u8) -> usize {
     // The renderer indexes the text by BYTE (the font is a byte-per-glyph
     // table), so the scroll span must be byte-based to stay in phase. Text is
     // already truncated to MARQUEE_TEXT_MAX chars at storage time.
-    let len = truncate_chars(text, MARQUEE_TEXT_MAX).as_bytes().len();
+    let len = truncate_chars(text, MARQUEE_TEXT_MAX).len();
     if len == 0 {
         return 0;
     }
