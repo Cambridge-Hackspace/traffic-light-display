@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "espidf")]
 use {
+    embedded_svc::http::server::Request,
     embedded_svc::http::Headers,
     esp_idf_hal::delay::FreeRtos,
     esp_idf_hal::gpio::{PinDriver, Pull},
@@ -34,7 +35,9 @@ use {
     esp_idf_hal::rmt::{config::TransmitConfig, TxRmtDriver},
     esp_idf_svc::eventloop::EspSystemEventLoop,
     esp_idf_svc::handle::RawHandle,
-    esp_idf_svc::http::server::{Configuration as HttpConfiguration, EspHttpServer},
+    esp_idf_svc::http::server::{
+        Configuration as HttpConfiguration, EspHttpConnection, EspHttpServer,
+    },
     esp_idf_svc::http::Method,
     esp_idf_svc::io::EspIOError,
     esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs},
@@ -61,6 +64,13 @@ pub enum PortalMode {
 // test-in-place (the setup-mode loop). Absent when there is no one to run it.
 #[cfg(target_os = "espidf")]
 type WifiTestSlot = Arc<Mutex<Option<(String, String)>>>;
+
+// The portal credentials, shared by every handler. Behind a mutex rather than
+// read fresh from NVS per request: NVS reads are flash reads, but a password
+// set through the portal should still take effect immediately rather than at
+// the next reboot.
+#[cfg(target_os = "espidf")]
+type AuthSlot = Arc<Mutex<AuthPolicy>>;
 
 // --------------------------------------------------------
 // ESP32 ENTRY POINT
@@ -164,7 +174,12 @@ fn main() {
                         if let Ok(nvs) = EspNvs::new(nvs_part_clone.clone(), "wifi_cfg", true) {
                             let _ = nvs.set_u8("wap_mode", 1);
                         }
-                        println!("> reboot into wireless setup");
+                        // Holding the button is the documented way back in for
+                        // someone who has lost the portal password. Whoever can
+                        // reach the button can already rewrite the wifi config,
+                        // so this concedes nothing that was being protected.
+                        clear_auth(&nvs_part_clone);
+                        println!("> reboot into wireless setup (portal password cleared)");
                         unsafe {
                             esp_idf_svc::sys::esp_restart();
                         }
@@ -936,6 +951,12 @@ fn start_portal(
         }
     };
     let mode = Arc::new(mode);
+    // Read once per portal rather than per request: NVS reads are flash reads,
+    // and a credential change reboots anyway.
+    let auth: AuthSlot = Arc::new(Mutex::new(load_auth_policy(&nvs_partition)));
+    if !auth.lock().map(|a| a.is_configured()).unwrap_or(false) {
+        println!("> warning: no portal password set; anyone on this network can reconfigure or reflash this light");
+    }
 
     // ---- GET / : the setup page ----
     {
@@ -943,9 +964,16 @@ fn start_portal(
         let ssids = ssids.clone();
         let nvs_partition = nvs_partition.clone();
         let mode = mode.clone();
-        let _ = server.fn_handler("/", Method::Get, move |req| {
+        let page_auth = auth.clone();
+        guarded(&mut server, "/", Method::Get, auth.clone(), move |req| {
             let port = read_listen_port(&nvs_partition);
-            let html = render_portal(&ssids, &display, port, &mode);
+            let html = match page_auth.lock() {
+                Ok(policy) => render_portal(&ssids, &display, port, &mode, &policy),
+                // Unreachable in practice: the guard this handler sits behind
+                // has already refused a poisoned lock. Serve something anyway
+                // rather than panic inside an http handler.
+                Err(_) => "<html><body>portal state unavailable</body></html>".to_string(),
+            };
             let mut res = req.into_ok_response()?;
             res.write_all(html.as_bytes())?;
             Ok::<(), EspIOError>(())
@@ -958,174 +986,237 @@ fn start_portal(
         let nvs_partition = nvs_partition.clone();
         let display = display.clone();
         let wifi_test = wifi_test.clone();
-        let _ = server.fn_handler("/save", Method::Post, move |mut req| {
-            let body = read_body(&mut req);
-            let fields = parse_form(&body);
+        let save_auth = auth.clone();
+        guarded(
+            &mut server,
+            "/save",
+            Method::Post,
+            auth.clone(),
+            move |mut req| {
+                let body = read_body(&mut req);
+                let fields = parse_form(&body);
 
-            // --- marquee + port config (disp_cfg namespace) ---
-            if let Ok(mut cfg) = EspNvs::new(nvs_partition.clone(), "disp_cfg", true) {
-                if let Some(v) = fields.get("mq_text") {
-                    let v = truncate_chars(v, MARQUEE_TEXT_MAX);
-                    write_str_if_changed(&mut cfg, "mq_text", &v);
-                    display.set_marquee_text(&v);
-                }
-                if let Some(v) = fields.get("mq_speed_ms") {
-                    if let Ok(ms) = v.parse::<u16>() {
-                        let ms = clamp_speed_ms(ms);
-                        write_u16_if_changed(&mut cfg, "mq_speed_ms", ms);
-                        display.set_marquee_speed_ms(ms);
+                // --- marquee + port config (disp_cfg namespace) ---
+                if let Ok(mut cfg) = EspNvs::new(nvs_partition.clone(), "disp_cfg", true) {
+                    if let Some(v) = fields.get("mq_text") {
+                        let v = truncate_chars(v, MARQUEE_TEXT_MAX);
+                        write_str_if_changed(&mut cfg, "mq_text", &v);
+                        display.set_marquee_text(&v);
                     }
-                }
-                if let Some(v) = fields.get("mq_orient") {
-                    if let Ok(o) = v.parse::<u8>() {
-                        let o = match o {
-                            ORIENT_0 | ORIENT_90 | ORIENT_180 | ORIENT_270 => o,
-                            _ => ORIENT_0,
-                        };
-                        write_u8_if_changed(&mut cfg, "mq_orient", o);
-                        display.set_orientation(o);
+                    if let Some(v) = fields.get("mq_speed_ms") {
+                        if let Ok(ms) = v.parse::<u16>() {
+                            let ms = clamp_speed_ms(ms);
+                            write_u16_if_changed(&mut cfg, "mq_speed_ms", ms);
+                            display.set_marquee_speed_ms(ms);
+                        }
                     }
-                }
-                if let Some(v) = fields.get("mq_dir") {
-                    if let Ok(d) = v.parse::<u8>() {
-                        // clamp against whatever orientation we just stored
-                        let cur_orient = display.marquee_config().orientation;
-                        let d = clamp_direction(cur_orient, d);
-                        write_u8_if_changed(&mut cfg, "mq_dir", d);
-                        display.set_direction(d);
+                    if let Some(v) = fields.get("mq_orient") {
+                        if let Ok(o) = v.parse::<u8>() {
+                            let o = match o {
+                                ORIENT_0 | ORIENT_90 | ORIENT_180 | ORIENT_270 => o,
+                                _ => ORIENT_0,
+                            };
+                            write_u8_if_changed(&mut cfg, "mq_orient", o);
+                            display.set_orientation(o);
+                        }
                     }
-                }
-                if let Some(v) = fields.get("panel_margin") {
-                    if let Ok(m) = v.parse::<u8>() {
-                        let m = m.min(PANEL_MARGIN_MAX);
-                        write_u8_if_changed(&mut cfg, "panel_margin", m);
-                        display.set_panel_margin(m);
+                    if let Some(v) = fields.get("mq_dir") {
+                        if let Ok(d) = v.parse::<u8>() {
+                            // clamp against whatever orientation we just stored
+                            let cur_orient = display.marquee_config().orientation;
+                            let d = clamp_direction(cur_orient, d);
+                            write_u8_if_changed(&mut cfg, "mq_dir", d);
+                            display.set_direction(d);
+                        }
                     }
-                }
-                // checkbox state sent explicitly as 0/1 by the page
-                if let Some(v) = fields.get("margin_streams") {
-                    let on = v == "1";
-                    write_u8_if_changed(&mut cfg, "margin_strm", on as u8);
-                    display.set_margin_applies_streams(on);
-                }
-                if let Some(v) = fields.get("listen_port") {
-                    if let Ok(p) = v.parse::<u16>() {
-                        if p != 0 {
-                            write_u16_if_changed(&mut cfg, "listen_port", p);
+                    if let Some(v) = fields.get("panel_margin") {
+                        if let Ok(m) = v.parse::<u8>() {
+                            let m = m.min(PANEL_MARGIN_MAX);
+                            write_u8_if_changed(&mut cfg, "panel_margin", m);
+                            display.set_panel_margin(m);
+                        }
+                    }
+                    // checkbox state sent explicitly as 0/1 by the page
+                    if let Some(v) = fields.get("margin_streams") {
+                        let on = v == "1";
+                        write_u8_if_changed(&mut cfg, "margin_strm", on as u8);
+                        display.set_margin_applies_streams(on);
+                    }
+                    if let Some(v) = fields.get("listen_port") {
+                        if let Ok(p) = v.parse::<u16>() {
+                            if p != 0 {
+                                write_u16_if_changed(&mut cfg, "listen_port", p);
+                            }
                         }
                     }
                 }
-            }
 
-            // --- wifi credentials (wifi_cfg namespace) ---
-            // ONLY touched when a non-empty SSID is supplied. A blank SSID means
-            // "keep the current network unchanged", so we never clobber stored
-            // credentials on a marquee-only save.
-            let mut queued_test = false;
-            if let Some(ssid) = fields.get("ssid") {
-                let ssid = ssid.trim();
-                if !ssid.is_empty() {
-                    let pass = fields.get("password").cloned().unwrap_or_default();
-                    if let Ok(mut wc) = EspNvs::new(nvs_partition.clone(), "wifi_cfg", true) {
-                        write_str_if_changed(&mut wc, "ssid", ssid);
-                        write_str_if_changed(&mut wc, "pass", &pass);
-                        // ensure the next boot attempts client mode
-                        write_u8_if_changed(&mut wc, "wap_mode", 0);
-                    }
-                    // In setup mode, queue a test-in-place for the AP loop to
-                    // run. On a live network there is no slot: the credentials
-                    // are simply stored and tried at the reboot that follows.
-                    if let Some(pending) = &wifi_test {
-                        if let Ok(mut slot) = pending.lock() {
-                            *slot = Some((ssid.to_string(), pass));
-                            queued_test = true;
+                // --- wifi credentials (wifi_cfg namespace) ---
+                // ONLY touched when a non-empty SSID is supplied. A blank SSID means
+                // "keep the current network unchanged", so we never clobber stored
+                // credentials on a marquee-only save.
+                let mut queued_test = false;
+                if let Some(ssid) = fields.get("ssid") {
+                    let ssid = ssid.trim();
+                    if !ssid.is_empty() {
+                        let pass = fields.get("password").cloned().unwrap_or_default();
+                        if let Ok(mut wc) = EspNvs::new(nvs_partition.clone(), "wifi_cfg", true) {
+                            write_str_if_changed(&mut wc, "ssid", ssid);
+                            write_str_if_changed(&mut wc, "pass", &pass);
+                            // ensure the next boot attempts client mode
+                            write_u8_if_changed(&mut wc, "wap_mode", 0);
+                        }
+                        // In setup mode, queue a test-in-place for the AP loop to
+                        // run. On a live network there is no slot: the credentials
+                        // are simply stored and tried at the reboot that follows.
+                        if let Some(pending) = &wifi_test {
+                            if let Ok(mut slot) = pending.lock() {
+                                *slot = Some((ssid.to_string(), pass));
+                                queued_test = true;
+                            }
                         }
                     }
                 }
-            }
 
-            if queued_test {
-                display.set_wifi_test(WifiTestResult::Testing);
-            }
+                // --- portal password (sec_cfg namespace) ---
+                // Same "blank means leave it alone" convention as the wifi password
+                // above, so the page never has to echo the stored secret back. The
+                // new credentials take effect on the next portal start, i.e. after
+                // the reboot the page performs.
+                if fields
+                    .get("portal_clear")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    clear_auth(&nvs_partition);
+                    if let Ok(mut policy) = save_auth.lock() {
+                        policy.user = AUTH_USER_DEFAULT.to_string();
+                        policy.pass = String::new();
+                    }
+                } else if let Some(new_pass) = fields.get("portal_pass") {
+                    if !new_pass.is_empty() {
+                        let user = fields
+                            .get("portal_user")
+                            .map(|u| u.trim())
+                            .filter(|u| !u.is_empty())
+                            .unwrap_or(AUTH_USER_DEFAULT)
+                            .to_string();
+                        if let Ok(mut sec) =
+                            EspNvs::new(nvs_partition.clone(), AUTH_NAMESPACE, true)
+                        {
+                            write_str_if_changed(&mut sec, "user", &user);
+                            write_str_if_changed(&mut sec, "pass", new_pass);
+                        }
+                        // Apply it to the running portal too, so the next request
+                        // is already challenged rather than waiting for a reboot.
+                        if let Ok(mut policy) = save_auth.lock() {
+                            policy.user = user;
+                            policy.pass = new_pass.clone();
+                        }
+                    }
+                }
 
-            let mut res = req.into_ok_response()?;
-            res.write_all(if queued_test {
-                b"saved-testing"
-            } else {
-                b"saved"
-            })?;
-            Ok::<(), EspIOError>(())
-        });
+                if queued_test {
+                    display.set_wifi_test(WifiTestResult::Testing);
+                }
+
+                let mut res = req.into_ok_response()?;
+                res.write_all(if queued_test {
+                    b"saved-testing"
+                } else {
+                    b"saved"
+                })?;
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     // ---- POST /preview : push marquee config to RAM only (no NVS) ----
     {
         let display = display.clone();
-        let _ = server.fn_handler("/preview", Method::Post, move |mut req| {
-            let body = read_body(&mut req);
-            let fields = parse_form(&body);
-            if let Some(v) = fields.get("mq_text") {
-                display.set_marquee_text(v);
-            }
-            if let Some(v) = fields.get("mq_speed_ms") {
-                if let Ok(ms) = v.parse::<u16>() {
-                    display.set_marquee_speed_ms(ms);
+        guarded(
+            &mut server,
+            "/preview",
+            Method::Post,
+            auth.clone(),
+            move |mut req| {
+                let body = read_body(&mut req);
+                let fields = parse_form(&body);
+                if let Some(v) = fields.get("mq_text") {
+                    display.set_marquee_text(v);
                 }
-            }
-            if let Some(v) = fields.get("mq_orient") {
-                if let Ok(o) = v.parse::<u8>() {
-                    display.set_orientation(o);
+                if let Some(v) = fields.get("mq_speed_ms") {
+                    if let Ok(ms) = v.parse::<u16>() {
+                        display.set_marquee_speed_ms(ms);
+                    }
                 }
-            }
-            if let Some(v) = fields.get("mq_dir") {
-                if let Ok(d) = v.parse::<u8>() {
-                    display.set_direction(d);
+                if let Some(v) = fields.get("mq_orient") {
+                    if let Ok(o) = v.parse::<u8>() {
+                        display.set_orientation(o);
+                    }
                 }
-            }
-            if let Some(v) = fields.get("panel_margin") {
-                if let Ok(m) = v.parse::<u8>() {
-                    display.set_panel_margin(m);
+                if let Some(v) = fields.get("mq_dir") {
+                    if let Ok(d) = v.parse::<u8>() {
+                        display.set_direction(d);
+                    }
                 }
-            }
-            // preview always sends the checkbox state explicitly as 0/1
-            if let Some(v) = fields.get("margin_streams") {
-                display.set_margin_applies_streams(v == "1");
-            }
-            let mut res = req.into_ok_response()?;
-            res.write_all(b"ok")?;
-            Ok::<(), EspIOError>(())
-        });
+                if let Some(v) = fields.get("panel_margin") {
+                    if let Ok(m) = v.parse::<u8>() {
+                        display.set_panel_margin(m);
+                    }
+                }
+                // preview always sends the checkbox state explicitly as 0/1
+                if let Some(v) = fields.get("margin_streams") {
+                    display.set_margin_applies_streams(v == "1");
+                }
+                let mut res = req.into_ok_response()?;
+                res.write_all(b"ok")?;
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     // ---- GET /status : current wifi test result as plain text for polling ----
     {
         let display = display.clone();
-        let _ = server.fn_handler("/status", Method::Get, move |req| {
-            let s = match display.wifi_test() {
-                WifiTestResult::Idle => "idle",
-                WifiTestResult::Testing => "testing",
-                WifiTestResult::Success => "success",
-                WifiTestResult::Failed => "failed",
-            };
-            let mut res = req.into_ok_response()?;
-            res.write_all(s.as_bytes())?;
-            Ok::<(), EspIOError>(())
-        });
+        guarded(
+            &mut server,
+            "/status",
+            Method::Get,
+            auth.clone(),
+            move |req| {
+                let s = match display.wifi_test() {
+                    WifiTestResult::Idle => "idle",
+                    WifiTestResult::Testing => "testing",
+                    WifiTestResult::Success => "success",
+                    WifiTestResult::Failed => "failed",
+                };
+                let mut res = req.into_ok_response()?;
+                res.write_all(s.as_bytes())?;
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     // ---- POST /reboot : explicit, user-initiated reboot ----
     {
-        let _ = server.fn_handler("/reboot", Method::Post, move |req| {
-            let mut res = req.into_ok_response()?;
-            res.write_all(b"rebooting")?;
-            std::thread::spawn(|| {
-                FreeRtos::delay_ms(1500);
-                unsafe {
-                    esp_idf_svc::sys::esp_restart();
-                }
-            });
-            Ok::<(), EspIOError>(())
-        });
+        guarded(
+            &mut server,
+            "/reboot",
+            Method::Post,
+            auth.clone(),
+            move |req| {
+                let mut res = req.into_ok_response()?;
+                res.write_all(b"rebooting")?;
+                std::thread::spawn(|| {
+                    FreeRtos::delay_ms(1500);
+                    unsafe {
+                        esp_idf_svc::sys::esp_restart();
+                    }
+                });
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     Some(server)
@@ -1192,6 +1283,212 @@ fn test_credentials(wifi: &mut EspWifi, ssid: &str, pass: &str) -> bool {
         FreeRtos::delay_ms(100);
     }
     false
+}
+
+// --------------------------------------------------------
+// PORTAL AUTHENTICATION
+// --------------------------------------------------------
+// The portal can change the wifi credentials, reboot the light and (since the
+// OTA work) replace its firmware, so it sits behind HTTP Basic auth. The parts
+// that decide whether a request is allowed are pure functions, compiled on the
+// host too, because they are the parts worth testing.
+
+// Where the portal credentials live. Its own namespace rather than wifi_cfg or
+// disp_cfg so that clearing either of those cannot lock anyone out.
+#[cfg(target_os = "espidf")]
+const AUTH_NAMESPACE: &str = "sec_cfg";
+
+// Used when nobody has set a username. The password has no default: an unset
+// password means the portal is open (see AuthPolicy::is_configured).
+#[cfg(any(target_os = "espidf", test))]
+const AUTH_USER_DEFAULT: &str = "admin";
+
+#[cfg(any(target_os = "espidf", test))]
+pub struct AuthPolicy {
+    pub user: String,
+    pub pass: String,
+}
+
+#[cfg(any(target_os = "espidf", test))]
+impl AuthPolicy {
+    // No stored password means nobody has set one yet, and the portal serves
+    // everyone. That keeps a firmware update from locking an existing light out
+    // of its own portal; the page nags about it instead, and the firmware
+    // upload endpoint refuses to run until a password exists.
+    pub fn is_configured(&self) -> bool {
+        !self.pass.is_empty()
+    }
+}
+
+// Decode standard base64 (RFC 4648, no line breaks, optional '=' padding).
+//
+// Hand-rolled because the generated esp-idf bindings do not expose mbedtls's
+// base64 -- and because a pure decoder can be tested on the host, which an FFI
+// call could not be. Output is capped: the only thing being decoded here is a
+// "user:password" pair, and an attacker should not be able to make the portal
+// allocate by sending a long header.
+#[cfg(any(target_os = "espidf", test))]
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const MAX_OUT: usize = 192;
+
+    fn sextet(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((b - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = s.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut i = 0;
+    while i < bytes.len() {
+        let chunk = &bytes[i..i + 4];
+        let is_last = i + 4 == bytes.len();
+        let mut acc: u32 = 0;
+        let mut pad = 0usize;
+        for (j, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                // Padding is legal only in the last two slots of the last chunk.
+                if !is_last || j < 2 {
+                    return None;
+                }
+                pad += 1;
+                acc <<= 6;
+            } else {
+                // ...and nothing may follow it.
+                if pad > 0 {
+                    return None;
+                }
+                acc = (acc << 6) | sextet(b)?;
+            }
+        }
+        for k in 0..(3 - pad) {
+            out.push(((acc >> (16 - 8 * k)) & 0xff) as u8);
+        }
+        if out.len() > MAX_OUT {
+            return None;
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+// Split an `Authorization: Basic <base64>` header into its user and password.
+// The scheme token is case-insensitive per RFC 7235, and only the first colon
+// separates the two, so a password may itself contain colons.
+#[cfg(any(target_os = "espidf", test))]
+fn parse_basic_auth(header: &str) -> Option<(String, String)> {
+    let (scheme, rest) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let text = String::from_utf8(base64_decode(rest.trim())?).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+// Compare without letting the time taken depend on how much of the secret
+// matched. The lengths are already observable from the wire, so only the
+// content has to be hidden; black_box keeps the optimiser from unrolling the
+// accumulation back into an early exit.
+#[cfg(any(target_os = "espidf", test))]
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u32;
+    for i in 0..a.len().min(b.len()) {
+        diff |= (a[i] ^ b[i]) as u32;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+// The whole access decision, in one testable place.
+#[cfg(any(target_os = "espidf", test))]
+fn auth_ok(header: Option<&str>, policy: &AuthPolicy) -> bool {
+    if !policy.is_configured() {
+        return true;
+    }
+    let Some(header) = header else {
+        return false;
+    };
+    let Some((user, pass)) = parse_basic_auth(header) else {
+        return false;
+    };
+    // Check both halves unconditionally so a wrong username does not answer
+    // faster than a wrong password.
+    let user_ok = ct_eq(user.as_bytes(), policy.user.as_bytes());
+    let pass_ok = ct_eq(pass.as_bytes(), policy.pass.as_bytes());
+    user_ok & pass_ok
+}
+
+#[cfg(target_os = "espidf")]
+fn load_auth_policy(nvs_partition: &EspDefaultNvsPartition) -> AuthPolicy {
+    let mut user = AUTH_USER_DEFAULT.to_string();
+    let mut pass = String::new();
+    if let Ok(nvs) = EspNvs::new(nvs_partition.clone(), AUTH_NAMESPACE, true) {
+        let mut user_buf = [0u8; 96];
+        let mut pass_buf = [0u8; 160];
+        if let Ok(Some(stored)) = nvs.get_str("user", &mut user_buf) {
+            if !stored.is_empty() {
+                user = stored.to_string();
+            }
+        }
+        if let Ok(Some(stored)) = nvs.get_str("pass", &mut pass_buf) {
+            pass = stored.to_string();
+        }
+    }
+    AuthPolicy { user, pass }
+}
+
+// Forget the portal credentials. Reached by holding BOOT, which is the way back
+// in for someone who has lost the password: physical access to the button
+// already implies control of the device.
+#[cfg(target_os = "espidf")]
+fn clear_auth(nvs_partition: &EspDefaultNvsPartition) {
+    if let Ok(mut nvs) = EspNvs::new(nvs_partition.clone(), AUTH_NAMESPACE, true) {
+        let _ = nvs.remove("user");
+        let _ = nvs.remove("pass");
+    }
+}
+
+// Register a handler behind the auth check, so no individual handler carries a
+// copy of it and none can be added without one.
+#[cfg(target_os = "espidf")]
+fn guarded<F>(
+    server: &mut EspHttpServer<'static>,
+    uri: &str,
+    method: Method,
+    policy: AuthSlot,
+    handler: F,
+) where
+    F: for<'r> Fn(Request<&mut EspHttpConnection<'r>>) -> Result<(), EspIOError> + Send + 'static,
+{
+    let _ = server.fn_handler(uri, method, move |req| {
+        let allowed = match policy.lock() {
+            Ok(policy) => auth_ok(req.header("Authorization"), &policy),
+            // A poisoned lock means a handler panicked while holding it. Refuse
+            // rather than guess which way to fail.
+            Err(_) => false,
+        };
+        if !allowed {
+            let mut res = req.into_response(
+                401,
+                Some("Unauthorized"),
+                &[
+                    ("WWW-Authenticate", "Basic realm=\"traffic light\""),
+                    ("Content-Type", "text/plain"),
+                ],
+            )?;
+            res.write_all(b"unauthorized\n")?;
+            return Ok::<(), EspIOError>(());
+        }
+        handler(req)
+    });
 }
 
 // --------------------------------------------------------
@@ -1272,8 +1569,19 @@ fn render_portal(
     display: &DisplayDriver,
     listen_port: u16,
     mode: &PortalMode,
+    auth: &AuthPolicy,
 ) -> String {
     let cfg = display.marquee_config();
+    // An unconfigured portal is open to everyone who can reach it, which is
+    // worth saying loudly rather than burying in the form below.
+    let auth_note = if auth.is_configured() {
+        String::new()
+    } else {
+        "<div class=\"status failed\">No portal password is set, so anyone on this network \
+         can reconfigure this light. Firmware uploads stay disabled until you set one.</div>"
+            .to_string()
+    };
+    let auth_user = html_escape(&auth.user);
     let (mode_note, reboot_note) = match mode {
         PortalMode::Setup => (String::new(), "The setup portal will close.".to_string()),
         PortalMode::Connected { ip } => (
@@ -1412,6 +1720,25 @@ fn render_portal(
             || d.listen_port !== SAVED.listen_port;
       }}
 
+      // The portal password is saved on its own rather than through the reboot
+      // path: it takes effect on the next request, so there is nothing to
+      // reboot for, and bundling a secret into the marquee payload would mean
+      // re-sending it on every unrelated save.
+      function savePortalAuth() {{
+        var pass = document.getElementById("portal_pass").value;
+        if (!pass) {{ alert("Enter a new password first."); return; }}
+        var user = document.getElementById("portal_user").value;
+        post("/save", {{ portal_user: user, portal_pass: pass }}).then(function() {{
+          alert("Password set. The browser will ask for it on the next page load.");
+          location.reload();
+        }});
+      }}
+
+      function clearPortalAuth() {{
+        if (!confirm("Remove the portal password? Anyone on this network will then be able to reconfigure and reflash this light.")) return;
+        post("/save", {{ portal_clear: "1" }}).then(function() {{ location.reload(); }});
+      }}
+
       // Single action: reboot. If the marquee settings or a wifi network changed,
       // offer to save first; otherwise just confirm the reboot.
       function doReboot() {{
@@ -1462,6 +1789,7 @@ fn render_portal(
     <div class="container">
       <h2>Traffic Light Setup</h2>
       {mode_note}
+      {auth_note}
 
       <h3>Wi-Fi</h3>
       <div id="wifi_status" class="status {status_class}">{status_text}</div>
@@ -1517,11 +1845,25 @@ fn render_portal(
         <input type="number" id="listen_port" min="1" max="65535" value="{port}" />
       </div>
 
+      <h3>Portal access</h3>
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="portal_user" value="{auth_user}" />
+      </div>
+      <div class="form-group">
+        <label>New password <span class="hint">(leave blank to keep the current one)</span></label>
+        <input type="password" id="portal_pass" />
+      </div>
+      <button onclick="savePortalAuth()">Set portal password</button>
+      <button onclick="clearPortalAuth()">Remove password</button>
+
       <button onclick="doReboot()">Reboot</button>
     </div>
   </body>
 </html>"#,
         mode_note = mode_note,
+        auth_note = auth_note,
+        auth_user = auth_user,
         reboot_note = reboot_note,
         status_class = wifi_status_class(display),
         status_text = wifi_status_text(display),
@@ -1743,9 +2085,27 @@ const FONT: [u8; 325] = [
 mod portal_tests {
     use super::*;
 
+    fn locked() -> AuthPolicy {
+        AuthPolicy {
+            user: AUTH_USER_DEFAULT.to_string(),
+            pass: "hunter2".to_string(),
+        }
+    }
+
+    fn open() -> AuthPolicy {
+        AuthPolicy {
+            user: AUTH_USER_DEFAULT.to_string(),
+            pass: String::new(),
+        }
+    }
+
     fn page(mode: PortalMode) -> String {
+        page_with(mode, &locked())
+    }
+
+    fn page_with(mode: PortalMode, auth: &AuthPolicy) -> String {
         let display = DisplayDriver::new_simulated();
-        render_portal(&["lab".to_string()], &display, 4048, &mode)
+        render_portal(&["lab".to_string()], &display, 4048, &mode, auth)
     }
 
     #[test]
@@ -1773,5 +2133,188 @@ mod portal_tests {
         });
         assert!(!p.contains("at <script>"));
         assert!(p.contains("at &lt;script&gt;"));
+    }
+
+    #[test]
+    fn a_portal_with_no_password_says_so_loudly() {
+        let p = page_with(PortalMode::Setup, &open());
+        assert!(p.contains("No portal password is set"));
+    }
+
+    #[test]
+    fn a_portal_with_a_password_does_not_nag() {
+        let p = page_with(PortalMode::Setup, &locked());
+        assert!(!p.contains("No portal password is set"));
+    }
+
+    #[test]
+    fn the_page_never_echoes_the_stored_password_back() {
+        // The password field is write-only by design: the page offers somewhere
+        // to type a new one and nothing that would leak the current one to a
+        // browser cache, a screenshot or a shoulder.
+        let p = page_with(PortalMode::Setup, &locked());
+        assert!(!p.contains("hunter2"));
+        assert!(p.contains("id=\"portal_pass\""));
+    }
+
+    #[test]
+    fn the_username_is_escaped_like_everything_else() {
+        let p = page_with(
+            PortalMode::Setup,
+            &AuthPolicy {
+                user: "a\"><script>".to_string(),
+                pass: "x".to_string(),
+            },
+        );
+        assert!(!p.contains("a\"><script>"));
+        assert!(p.contains("&lt;script&gt;"));
+    }
+}
+
+// Authentication is the part of the portal where being wrong is expensive, and
+// all of it is pure, so all of it is tested here rather than on the device.
+#[cfg(all(test, not(target_os = "espidf")))]
+mod auth_tests {
+    use super::*;
+
+    fn policy(user: &str, pass: &str) -> AuthPolicy {
+        AuthPolicy {
+            user: user.to_string(),
+            pass: pass.to_string(),
+        }
+    }
+
+    fn header(user: &str, pass: &str) -> String {
+        // Encode with an independent implementation so the test is not just
+        // base64_decode agreeing with itself.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let raw = format!("{}:{}", user, pass).into_bytes();
+        let mut out = String::from("Basic ");
+        for chunk in raw.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base64_decodes_the_rfc4648_vectors() {
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
+        assert_eq!(base64_decode("YWRtaW46c2VjcmV0").unwrap(), b"admin:secret");
+    }
+
+    #[test]
+    fn base64_rejects_what_is_not_base64() {
+        assert!(base64_decode("Zm9").is_none(), "length not a multiple of 4");
+        assert!(
+            base64_decode("Zm9!").is_none(),
+            "character outside alphabet"
+        );
+        assert!(base64_decode("Z=9v").is_none(), "padding in the middle");
+        assert!(
+            base64_decode("Zm==Zm9v").is_none(),
+            "padding before the end"
+        );
+        assert!(base64_decode("Z===").is_none(), "three padding characters");
+        // An over-long header must not make the device allocate for it.
+        assert!(base64_decode(&"QUJD".repeat(200)).is_none());
+    }
+
+    #[test]
+    fn basic_auth_splits_the_header() {
+        assert_eq!(
+            parse_basic_auth("Basic YWRtaW46c2VjcmV0"),
+            Some(("admin".to_string(), "secret".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_scheme_token_is_case_insensitive() {
+        // RFC 7235: the auth scheme is a case-insensitive token, and real
+        // clients do send "basic".
+        assert!(parse_basic_auth("basic YWRtaW46c2VjcmV0").is_some());
+        assert!(parse_basic_auth("BASIC YWRtaW46c2VjcmV0").is_some());
+        assert!(parse_basic_auth("Bearer YWRtaW46c2VjcmV0").is_none());
+    }
+
+    #[test]
+    fn a_password_may_contain_colons() {
+        assert_eq!(
+            parse_basic_auth(&header("admin", "a:b:c")),
+            Some(("admin".to_string(), "a:b:c".to_string()))
+        );
+    }
+
+    #[test]
+    fn malformed_headers_are_rejected_rather_than_guessed_at() {
+        assert!(parse_basic_auth("Basic").is_none(), "no credential at all");
+        assert!(parse_basic_auth("Basic !!!!").is_none(), "not base64");
+        assert!(
+            parse_basic_auth(&{
+                let mut h = String::from("Basic ");
+                h.push_str("bm9jb2xvbg==");
+                h
+            })
+            .is_none(),
+            "decodes, but has no colon"
+        );
+    }
+
+    #[test]
+    fn ct_eq_agrees_with_ordinary_equality() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secrer"), "differs in the last byte");
+        assert!(!ct_eq(b"secret", b"tecret"), "differs in the first byte");
+        assert!(!ct_eq(b"secret", b"secretx"), "prefix is not a match");
+        assert!(!ct_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn an_unconfigured_portal_lets_everyone_in() {
+        // Deliberate: a firmware update must not lock an existing light out of
+        // its own portal. The page nags and /ota refuses instead.
+        let p = policy("admin", "");
+        assert!(auth_ok(None, &p));
+        assert!(auth_ok(Some(&header("nobody", "nothing")), &p));
+    }
+
+    #[test]
+    fn a_configured_portal_wants_the_right_credentials() {
+        let p = policy(AUTH_USER_DEFAULT, "hunter2");
+        assert!(auth_ok(Some(&header(AUTH_USER_DEFAULT, "hunter2")), &p));
+        assert!(
+            !auth_ok(Some(&header("admin", "hunter3")), &p),
+            "wrong password"
+        );
+        assert!(!auth_ok(Some(&header("root", "hunter2")), &p), "wrong user");
+        assert!(!auth_ok(None, &p), "no header");
+        assert!(!auth_ok(Some("Basic !!!"), &p), "unparseable header");
+        assert!(!auth_ok(Some(&header("admin", "")), &p), "empty password");
+    }
+
+    #[test]
+    fn a_password_that_is_a_prefix_of_the_real_one_is_not_enough() {
+        // The bug this guards against is comparing only min(len) bytes.
+        let p = policy("admin", "hunter2");
+        assert!(!auth_ok(Some(&header("admin", "hunter")), &p));
+        assert!(!auth_ok(Some(&header("admin", "hunter22")), &p));
     }
 }
