@@ -1311,30 +1311,37 @@ fn start_portal(
     // Deliberately a new endpoint rather than an extension of /status, whose
     // bare-word body the portal's own javascript string-compares.
     {
-        let _ = server.fn_handler("/version", Method::Get, move |req| {
-            let uptime_ms = unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1000;
-            let state = EspOta::new()
-                .and_then(|ota| ota.get_running_slot())
-                .map(|slot| format!("{:?}", slot.state).to_lowercase())
-                .unwrap_or_else(|_| "unknown".to_string());
-            let body = format!(
-                concat!(
-                    "{{\"name\":\"{}\",\"version\":\"{}\",\"idf\":\"{}\",",
-                    "\"partition\":\"{}\",\"elf_sha256\":\"{}\",",
-                    "\"ota_state\":\"{}\",\"uptime_ms\":{}}}"
-                ),
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
-                running_idf_version(),
-                running_slot_label(),
-                running_elf_sha256(),
-                state,
-                uptime_ms,
-            );
-            let mut res = req.into_response(200, None, &[("Content-Type", "application/json")])?;
-            res.write_all(body.as_bytes())?;
-            Ok::<(), EspIOError>(())
-        });
+        guarded(
+            &mut server,
+            "/version",
+            Method::Get,
+            auth.clone(),
+            move |req| {
+                let uptime_ms = unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1000;
+                let state = EspOta::new()
+                    .and_then(|ota| ota.get_running_slot())
+                    .map(|slot| format!("{:?}", slot.state).to_lowercase())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let body = format!(
+                    concat!(
+                        "{{\"name\":\"{}\",\"version\":\"{}\",\"idf\":\"{}\",",
+                        "\"partition\":\"{}\",\"elf_sha256\":\"{}\",",
+                        "\"ota_state\":\"{}\",\"uptime_ms\":{}}}"
+                    ),
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION"),
+                    running_idf_version(),
+                    running_slot_label(),
+                    running_elf_sha256(),
+                    state,
+                    uptime_ms,
+                );
+                let mut res =
+                    req.into_response(200, None, &[("Content-Type", "application/json")])?;
+                res.write_all(body.as_bytes())?;
+                Ok::<(), EspIOError>(())
+            },
+        );
     }
 
     // ---- POST /ota : a raw application image, straight into the spare slot ----
@@ -3077,6 +3084,27 @@ mod auth_tests {
         assert!(!auth_ok(None, &p), "no header");
         assert!(!auth_ok(Some("Basic !!!"), &p), "unparseable header");
         assert!(!auth_ok(Some(&header("admin", "")), &p), "empty password");
+    }
+
+    #[test]
+    fn every_route_goes_through_the_auth_guard() {
+        // guarded() exists so that no handler carries its own copy of the auth
+        // check and none can be registered without one. That is only true if
+        // nothing calls fn_handler directly, which is a property of the source
+        // rather than of any value, so it is asserted against the source.
+        //
+        // Written because the claim was made and then immediately broken: the
+        // /version route went in with a bare fn_handler and served unauthenticated
+        // on the real device until someone happened to curl it.
+        let src = include_str!("main.rs");
+        // Split so this test does not match its own source and count itself.
+        let needle = concat!("server.", "fn_handler(");
+        let direct = src.matches(needle).count();
+        assert_eq!(
+            direct, 1,
+            "expected exactly one fn_handler call (the one inside guarded()); \
+             a route registered directly would not be behind the password"
+        );
     }
 
     #[test]
