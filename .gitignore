@@ -86,6 +86,10 @@ Sessionx.vim
 sftp-config.json
 sftp-settings.json
 
+# --- Local deployment settings ---
+# The default device for `cargo run --release -- ota`, per checkout.
+/.ota-host
+
 # --- Compiled / Binary Artifacts ---
 *.exe
 *.exe~

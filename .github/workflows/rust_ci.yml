@@ -40,3 +40,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run command
         run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+
+  shell-checks:
+    name: Flashing Scripts
+    runs-on: ubuntu-latest
+    # Deliberately its own job rather than another matrix entry: every entry of
+    # the matrix above installs the xtensa toolchain, and none of this needs it.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh
+      - name: Script self-test
+        run: scripts/ota-push.sh --self-test
+      - name: Push script end-to-end tests
+        run: scripts/test-ota-push.sh
