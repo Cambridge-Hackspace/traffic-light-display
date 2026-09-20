@@ -211,10 +211,12 @@ CSV
 
     # A plausible image, and each way of being implausible.
     make_image() { # path size first_byte appdesc
-        printf '%b' "$3" >"$1"
-        dd if=/dev/zero bs=1 count=31 >>"$1" 2>/dev/null
-        printf '%b' "$4" >>"$1"
-        dd if=/dev/zero bs=1024 count="$2" >>"$1" 2>/dev/null
+    {
+        printf '%b' "$3"
+        dd if=/dev/zero bs=1 count=31 2>/dev/null
+        printf '%b' "$4"
+        dd if=/dev/zero bs=1024 count="$2" 2>/dev/null
+    } >"$1"
     }
     make_image "$tmp/good.bin" 512 '\351' '\062\124\315\253'
     make_image "$tmp/badmagic.bin" 512 '\052' '\062\124\315\253'
@@ -236,9 +238,11 @@ CSV
     check "flags an oversize image separately" 2 "$(try "$tmp/good.bin" 65536)"
 
     # The descriptor hash the device reports lives 176 bytes into the image.
-    dd if=/dev/zero bs=1 count=176 >"$tmp/sha.bin" 2>/dev/null
-    printf '%b' '\001\043\105\147' >>"$tmp/sha.bin"
-    dd if=/dev/zero bs=1 count=28 >>"$tmp/sha.bin" 2>/dev/null
+    {
+        dd if=/dev/zero bs=1 count=176 2>/dev/null
+        printf '%b' '\001\043\105\147'
+        dd if=/dev/zero bs=1 count=28 2>/dev/null
+    } >"$tmp/sha.bin"
     check "image_elf_sha reads offset 176" \
         "01234567$(printf '00%.0s' $(seq 1 28))" "$(image_elf_sha "$tmp/sha.bin")"
 

@@ -24,7 +24,7 @@ if [ "$#" -gt 0 ]; then
     if [ ! -x "$here/ota-push.sh" ]; then
         printf 'error: %s is missing, so there is no way to push over the network.\n' \
             "$here/ota-push.sh" >&2
-        printf '       Run `cargo run --release` with no arguments to flash over USB.\n' >&2
+        printf '       Run "cargo run --release" with no arguments to flash over USB.\n' >&2
         exit 1
     fi
     exec "$here/ota-push.sh" --elf "$elf" "$@"

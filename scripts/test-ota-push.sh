@@ -41,10 +41,12 @@ check() { # check <name> <expected-exit> <cmd...>
 
 # --- fixtures: a plausible image, and the ways of being implausible ----------
 make_image() { # path kilobytes first_byte appdesc_bytes
-    printf '%b' "$3" >"$1"
-    dd if=/dev/zero bs=1 count=31 >>"$1" 2>/dev/null
-    printf '%b' "$4" >>"$1"
-    dd if=/dev/zero bs=1024 count="$2" >>"$1" 2>/dev/null
+    {
+        printf '%b' "$3"
+        dd if=/dev/zero bs=1 count=31 2>/dev/null
+        printf '%b' "$4"
+        dd if=/dev/zero bs=1024 count="$2" 2>/dev/null
+    } >"$1"
 }
 GOOD_DESC='\062\124\315\253'
 make_image "$TMP/good.bin" 512 '\351' "$GOOD_DESC"
