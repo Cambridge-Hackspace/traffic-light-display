@@ -1,0 +1,24 @@
+# Partition table for the 4MB ESP32 module in the traffic light.
+#
+# Two app slots so firmware can be replaced over the air: the running image
+# writes the other slot and the bootloader swaps to it on the next boot.
+#
+# nvs and phy_init are pinned to the offsets and sizes the stock single-app
+# layout gave them, so the stored wifi credentials and display config survive
+# the one serial flash that installs this table. ESP-IDF's own
+# partitions_two_ota.csv shrinks nvs to 0x4000, which would wipe them.
+#
+# There is no factory slot: three ~1.9M app partitions do not fit in 4MB, and
+# with otadata erased the bootloader falls through to ota_0 anyway, which is
+# what a serial flash produces.
+#
+# The two slots divide the flash above otadata exactly: 0x20000 + 2*0x1F0000
+# = 0x400000. App partitions must start on a 64K boundary, so the 0xE000
+# between otadata and ota_0 is unallocated padding, which is the only waste.
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  0x1F0000,
+ota_1,    app,  ota_1,   0x210000, 0x1F0000,

@@ -3,7 +3,9 @@ target = "xtensa-esp32-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+# Dispatches on the args after `--`: none means a serial flash + monitor, a
+# host means an OTA push. See scripts/cargo-runner.sh.
+runner = "scripts/cargo-runner.sh"
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]
