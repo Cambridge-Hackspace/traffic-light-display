@@ -8,7 +8,10 @@ rust-version = "1.82"
 
 [[bin]]
 name = "traffic-light-display"
-harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
+# Keep the test build out of rust-analyzer's default (--all-targets) checks on the
+# xtensa target, where the `test` crate is not built. Unit tests run on the host:
+#   cargo +stable test --target x86_64-unknown-linux-gnu --bin traffic-light-display
+test = false
 
 [profile.release]
 opt-level = "s"
@@ -30,7 +33,7 @@ esp-idf-svc = { version = "0.51.0", features = ["critical-section"] }
 ws2812-esp32-rmt-driver = { version = "0.13.1", features = ["smart-leds-trait"] }
 
 [build-dependencies]
-embuild = "0.33"
+embuild = { version = "0.33", features = ["espidf"] }
 
 [features]
 console-sim = []

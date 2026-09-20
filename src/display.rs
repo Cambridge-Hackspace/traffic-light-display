@@ -2,6 +2,8 @@
 use esp_idf_hal::delay::FreeRtos;
 #[cfg(target_os = "espidf")]
 use esp_idf_hal::{cpu::Core, task::thread::ThreadSpawnConfiguration};
+#[cfg(not(target_os = "espidf"))]
+use smart_leds::RGB8;
 #[cfg(target_os = "espidf")]
 use smart_leds::{SmartLedsWrite, RGB8};
 use std::sync::{Arc, Mutex};
@@ -120,20 +122,28 @@ impl DisplayDriver {
         )
     }
 
+    #[cfg(any(target_os = "espidf", test))]
+    /// Maps a logical pixel of the 30x10 image to its index on the matrix
+    /// part of the string (0..299, before the sacrificial LEDs are added).
+    ///
+    /// Physical layout, seen from the front with the red lamp on the left and
+    /// the blue lamp on the right (measured with the camera, 2026-09-20):
+    /// every panel is ten vertical serpentine columns of ten LEDs. The data
+    /// line enters the string at the blue lamp and runs left-to-right across
+    /// it, then left-to-right across amber, then across red. Physical column
+    /// 0 is therefore the left edge of the blue lamp and column 29 the right
+    /// edge of the red lamp. Even columns are wired bottom-to-top, odd
+    /// columns top-to-bottom.
     fn get_pixel_index(lx: usize, ly: usize) -> Option<usize> {
-        // translate logical coordinates to the physical matrix orientation
-        let (px, py) = match lx {
-            0..=9 => (lx, ly),        // panel 0: normal
-            10..=19 => (29 - lx, ly), // panel 1: mirrored horizontally
-            20..=29 => (49 - lx, ly), // panel 2: rotated by 180 degrees
-            _ => return None,
-        };
-
-        // transform x-coordinates where x = 29 is the first physical column (c=0)
-        let c = 29 - px;
-
-        // serpentine vertical mapping
-        let offset = if c % 2 == 0 { py } else { 9 - py };
+        if lx >= 30 || ly >= 10 {
+            return None;
+        }
+        // the string visits the logical panels in reverse order (2, 1, 0)
+        // but runs in the logical x direction within each one
+        let panel = lx / 10;
+        let c = (2 - panel) * 10 + lx % 10;
+        // serpentine: even columns start at the bottom, odd ones at the top
+        let offset = if c % 2 == 0 { 9 - ly } else { ly };
         Some(c * 10 + offset)
     }
 
@@ -158,5 +168,96 @@ impl DisplayDriver {
         }
         out.push_str("+------------------------------------------------------------+\n");
         print!("{}", out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisplayDriver;
+
+    fn idx(lx: usize, ly: usize) -> usize {
+        DisplayDriver::get_pixel_index(lx, ly).unwrap()
+    }
+
+    #[test]
+    fn corners_land_where_the_camera_saw_them() {
+        // red lamp (logical panel 0) is the tail of the string: columns 20..29
+        assert_eq!(
+            idx(0, 0),
+            209,
+            "red top-left: column 20 (even, bottom-up), top LED"
+        );
+        assert_eq!(idx(0, 9), 200, "red bottom-left");
+        assert_eq!(
+            idx(9, 0),
+            290,
+            "red top-right: column 29 (odd, top-down), first LED"
+        );
+        assert_eq!(idx(9, 9), 299, "red bottom-right");
+        // amber lamp (panel 1): columns 10..19
+        assert_eq!(idx(10, 0), 109, "amber top-left");
+        assert_eq!(idx(19, 9), 199, "amber bottom-right");
+        // blue lamp (panel 2) is the head of the string: columns 0..9
+        assert_eq!(
+            idx(20, 0),
+            9,
+            "blue top-left is the top of the first column"
+        );
+        assert_eq!(
+            idx(20, 9),
+            0,
+            "blue bottom-left is the very first matrix LED"
+        );
+        assert_eq!(idx(29, 0), 90, "blue top-right");
+        assert_eq!(idx(29, 9), 99, "blue bottom-right");
+    }
+
+    #[test]
+    fn every_panel_is_a_contiguous_block_with_x_running_left_to_right() {
+        for panel in 0..3 {
+            let base = (2 - panel) * 100;
+            for lx in panel * 10..(panel + 1) * 10 {
+                for ly in 0..10 {
+                    let i = idx(lx, ly);
+                    assert!(
+                        i >= base && i < base + 100,
+                        "({lx},{ly}) -> {i} outside panel block"
+                    );
+                    assert_eq!(i / 10, base / 10 + lx % 10, "column of ({lx},{ly})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rows_are_horizontal_and_y_runs_top_to_bottom() {
+        // moving one LED down a column must move one step along the string in
+        // the direction that column is wired
+        for lx in 0..30 {
+            for ly in 0..9 {
+                let step = idx(lx, ly + 1) as isize - idx(lx, ly) as isize;
+                let expected = if (idx(lx, ly) / 10) % 2 == 0 { -1 } else { 1 };
+                assert_eq!(step, expected, "({lx},{ly})");
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_is_a_bijection_over_the_matrix() {
+        let mut seen = [false; 300];
+        for ly in 0..10 {
+            for lx in 0..30 {
+                let i = idx(lx, ly);
+                assert!(!seen[i], "index {i} hit twice");
+                seen[i] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s));
+    }
+
+    #[test]
+    fn out_of_range_is_none() {
+        assert_eq!(DisplayDriver::get_pixel_index(30, 0), None);
+        assert_eq!(DisplayDriver::get_pixel_index(0, 10), None);
     }
 }
